@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # OpenFugu — Apache-2.0. Part of an independent, open reimplementation of
 # the Fugu orchestrator. NOT affiliated with Sakana AI. See NOTICE.
 # Reference: OpenAI-compatible serving layer for the OpenFugu TRINITY coordinator. Original code.
@@ -7,32 +6,28 @@ serve.py — Fugu as a single OpenAI-compatible model endpoint.
 
 This is Fugu's real product surface: "one model to command them all". A client
 POSTs to /v1/chat/completions as if calling one model; internally the TRINITY
-coordinator (Qwen3-0.6B + model_iter_60.npy) routes each turn to a worker from a
-real pool (via litellm) and runs the step_trinity loop until a verifier accepts.
-The caller never sees the pool.
+coordinator asks an API router model which worker of the pool acts next, and
+runs the step_trinity loop until a verifier accepts. The caller never sees the
+pool.
 
 stdlib http.server only — no FastAPI/uvicorn (ponytail: a router endpoint needs
 a socket and a JSON handler, not a web framework).
 
 Run:
-  FUGU_API_KEY=... FUGU_BASE_URL=... \
-  python serve.py --model <qwen3-0.6b dir> --vector model_iter_60.npy \
-                  --slot-models <csv of litellm worker ids> --port 8088
+  FUGU_CONDUCTOR_MODEL=... FUGU_API_KEY=... FUGU_BASE_URL=... \
+  python -m openfugu.serve --slot-models <csv of litellm worker ids> --port 8088
 
 Query:
   curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"..."}]}'
 """
 from __future__ import annotations
-import argparse, glob, json, os, sys, time, uuid
-import numpy as np
+import argparse, json, sys, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# reuse the faithful implementation
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mini import (FuguRouter, Coordinator, LiteLLMWorker, MockWorker,
-                  DEFAULT_SLOT_LABELS, HEAD_ROWS, HIDDEN)
+from openfugu.llm import ConfigError, check_endpoint, router_endpoint
+from openfugu.mini import ApiRouter, Coordinator, LiteLLMWorker
 
-ROUTER: FuguRouter | None = None
+ROUTER: ApiRouter | None = None
 WORKER = None
 MODEL_NAME = "fugu"
 MAX_TURNS = 5
@@ -86,8 +81,8 @@ class Handler(BaseHTTPRequestHandler):
             # the user query = last user message; coordinator runs the full loop
             query = next((m["content"] for m in reversed(messages)
                           if m.get("role") == "user"), "")
-            coord = Coordinator(ROUTER, WORKER, max_turns=MAX_TURNS, sample=True)
-            res = coord.run(query, verbose=False)
+            coord = Coordinator(ROUTER, WORKER, max_turns=MAX_TURNS)
+            res = coord.run(query)
             self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME),
                                            len(res.turns)))
         except Exception as e:
@@ -100,34 +95,24 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global ROUTER, WORKER, MAX_TURNS
     ap = argparse.ArgumentParser(description="Serve Fugu as one OpenAI-compatible model.")
-    ap.add_argument("--model", required=True, help="Qwen3-0.6B dir")
-    ap.add_argument("--vector", default="model_iter_60.npy",
-                    help="base vector (19456) — SVF + head")
-    ap.add_argument("--head", default=None,
-                    help="optional trained head-only vector (10240); overrides the "
-                         "head from --vector after SVF is applied")
-    ap.add_argument("--slot-models", metavar="CSV", help="litellm worker ids; omit for mock")
+    ap.add_argument("--slot-models", metavar="CSV", required=True,
+                    help="comma-separated litellm worker model ids, one per agent slot")
     ap.add_argument("--port", type=int, default=8088)
     ap.add_argument("--max-turns", type=int, default=5)
     args = ap.parse_args()
     MAX_TURNS = args.max_turns
+    slot_models = args.slot_models.split(",")
 
-    print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
-    ROUTER = FuguRouter(args.model, args.vector, seed=0)
-    if args.head:                                  # layer a trained head over base SVF
-        h = np.load(args.head).astype(np.float64)
-        if h.shape != (HEAD_ROWS * HIDDEN,):
-            raise ValueError(f"--head must be {HEAD_ROWS * HIDDEN} floats, got {h.shape}")
-        ROUTER.head = ROUTER.torch.from_numpy(h.copy()).float().reshape(
-            HEAD_ROWS, HIDDEN).to(ROUTER.device)
-        print(f"[serve] applied trained head from {args.head}", flush=True)
+    try:
+        endpoint = router_endpoint()
+        check_endpoint(endpoint, "router")
+    except ConfigError as exc:
+        sys.exit(f"[serve] configuration error: {exc}")
+    ROUTER = ApiRouter(endpoint, slot_models)
+    print(f"[serve] router: {endpoint.model}", flush=True)
 
-    if args.slot_models:
-        WORKER = LiteLLMWorker(slot_models=args.slot_models.split(","))
-        print(f"[serve] worker pool: litellm ({len(args.slot_models.split(','))} slots)", flush=True)
-    else:
-        WORKER = MockWorker()
-        print("[serve] worker pool: MOCK (no --slot-models given)", flush=True)
+    WORKER = LiteLLMWorker(slot_models=slot_models)
+    print(f"[serve] worker pool: litellm ({len(slot_models)} slots)", flush=True)
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"[serve] Fugu listening on :{args.port} — POST /v1/chat/completions", flush=True)
