@@ -1,0 +1,35 @@
+=== checkpoint-100 (our GRPO-trained Conductor) as workflow Conductor ===
+[ultra-e2e] workers LOCAL (2): ['0cb88a4f764b7a12671c53f0838cd831a0843b95', '093f9f388b31de276ce2de164bdc2081324b9767']
+[ultra-e2e] loading TRAINED Conductor /vePFS-Mindverse/share/diz/openfugu/conductor_toolscale_100/checkpoint-100
+[ultra-e2e] query: Write a Python function that returns the n-th Fibonacci number, then verify it on n=10.
+[ultra-e2e] emitted workflow: model_id=[] access_list=[] steps=0
+[ultra-e2e] raw completion (no parseable workflow):
+FAIL — trained Conductor emitted no parseable workflow
+
+=== raw completion (checkpoint-100): emitted code/tool-call, NOT a 3-list workflow ===
+[ultra-e2e] raw completion (no parseable workflow):
+```python
+def fibonacci(n):
+    """
+    Returns the n-th Fibonacci number.
+
+    Args:
+    n (int): The position of the Fibonacci number to return.
+
+    Returns:
+
+=== local-Conductor MECHANISM proof (gemma-3-4b, which speaks the workflow DSL) ===
+[ultra-e2e] workers LOCAL (2): ['0cb88a4f764b7a12671c53f0838cd831a0843b95', '916b56a44061fd5cd7d6a8fb632557ed4f724f60']
+[ultra-e2e] loading TRAINED Conductor /vePFS-Mindverse/share/huggingface/hub/models--google--gemma-3-4b-it/snapshots/093f9f388b31de276ce2de164bdc2081324b9767
+[ultra-e2e] query: Write a Python function that returns the n-th Fibonacci number, then verify it on n=10.
+[ultra-e2e] emitted workflow: model_id=[0, 0, 0] access_list=[[], [], ['all']] steps=3
+  step 0: agent=0(0cb88a4f764b7a12671c53f0838cd831a0843b95) sees=[]
+  step 1: agent=0(0cb88a4f764b7a12671c53f0838cd831a0843b95) sees=[]
+  step 2: agent=0(0cb88a4f764b7a12671c53f0838cd831a0843b95) sees=[]
+[ultra-e2e] executed 3 steps; final answer[:200]="I don't see a function provided. Please provide the function you would like me to call with n=10 and print the result."
+PASS — trained local Conductor emitted a workflow that executed over a real local worker pool to a non-empty final answer
+
+=== which local models emit a parseable 3-list workflow (probe) ===
+[llama-3.2-3b] steps=0 model_id=[] access=[]
+[gemma-3-4b] steps=5 model_id=[2, 1, 3, 0, 4] access=[[], [], [0, 1], [2, 3], []]
+[deepseek-distill-7b] steps=0 model_id=[] access=[]

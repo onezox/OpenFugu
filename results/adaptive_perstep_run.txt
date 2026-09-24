@@ -1,0 +1,11 @@
+[adaptive-perstep] pool (3): ['deepseek-distill-7b', 'llama-3.2-3b', 'gemma-3-4b']  k=2
+[adaptive-perstep] base head, subset-masked rollout solved=0.625  (n=8)
+[iter 0] best_subset_aware=1.000 (base 0.625)
+[iter 1] best_subset_aware=1.000 (base 0.625)
+[iter 2] best_subset_aware=1.000 (base 0.625)
+[iter 3] best_subset_aware=1.000 (base 0.625)
+[iter 4] best_subset_aware=1.000 (base 0.625)
+[iter 5] best_subset_aware=1.000 (base 0.625)
+[result] subset-aware trained=1.000  vs base (subset-masked)=0.625
+[result] saved adaptive_perstep.npy
+PASS — sep-CMA over random k-of-n subsets improved subset-aware per-step routing

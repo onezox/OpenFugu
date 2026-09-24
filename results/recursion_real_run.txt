@@ -1,0 +1,43 @@
+[recursion-real] base=checkpoint-100 train=229 steps=30
+[recursion-real] REAL recursion: round-0 self-rollout fed back into round-1 GRPO prompt. starting...
+  3%|▎         | 1/30 [00:53<25:54, 53.61s/it][step 1] reward=1.693 rev=0.693 fmt=1.000 std=0.011
+[step 2] reward=1.684 rev=0.684 fmt=1.000 std=0.000
+[step 3] reward=1.628 rev=0.636 fmt=0.992 std=0.038
+[step 4] reward=1.648 rev=0.648 fmt=1.000 std=0.000
+[step 5] reward=1.547 rev=0.555 fmt=0.992 std=0.036
+[step 6] reward=1.642 rev=0.642 fmt=1.000 std=0.000
+[step 7] reward=1.677 rev=0.677 fmt=1.000 std=0.000
+[step 8] reward=1.644 rev=0.644 fmt=1.000 std=0.000
+[step 9] reward=1.453 rev=0.578 fmt=0.875 std=0.000
+[step 10] reward=1.679 rev=0.679 fmt=1.000 std=0.000
+[step 11] reward=1.665 rev=0.665 fmt=1.000 std=0.000
+[step 12] reward=1.695 rev=0.695 fmt=1.000 std=0.000
+[step 13] reward=1.633 rev=0.633 fmt=1.000 std=0.000
+[step 14] reward=1.669 rev=0.669 fmt=1.000 std=0.000
+[step 15] reward=1.513 rev=0.513 fmt=1.000 std=0.000
+[step 16] reward=1.618 rev=0.618 fmt=1.000 std=0.000
+[step 17] reward=1.634 rev=0.634 fmt=1.000 std=0.014
+[step 18] reward=1.683 rev=0.683 fmt=1.000 std=0.000
+[step 19] reward=1.653 rev=0.653 fmt=1.000 std=0.000
+[step 20] reward=1.639 rev=0.639 fmt=1.000 std=0.000
+[step 21] reward=1.653 rev=0.653 fmt=1.000 std=0.000
+[step 22] reward=1.496 rev=0.496 fmt=1.000 std=0.000
+[step 23] reward=1.524 rev=0.618 fmt=0.906 std=0.068
+[step 24] reward=1.614 rev=0.614 fmt=1.000 std=0.000
+[step 25] reward=1.691 rev=0.691 fmt=1.000 std=0.000
+[step 26] reward=1.688 rev=0.688 fmt=1.000 std=0.000
+[step 27] reward=1.590 rev=0.590 fmt=1.000 std=0.000
+[step 28] reward=1.476 rev=0.601 fmt=0.875 std=0.000
+[step 29] reward=1.659 rev=0.659 fmt=1.000 std=0.000
+[recursion-real] DONE — saved to /vePFS-Mindverse/share/diz/openfugu/conductor_recursion_real
+===EVAL===
+[eval-recur] model=conductor_recursion_real held-out n=40
+  [10/40] r0=0.655 r1=0.650
+  [20/40] r0=0.639 r1=0.637
+  [30/40] r0=0.639 r1=0.637
+  [40/40] r0=0.617 r1=0.616
+[result] round-0 mean score = 0.617
+[result] round-1 mean score = 0.616  (-0.2%)
+[result] questions improved by revise = 0/40; regressed = 1
+[result] on round-0 misses (n=40), revise delta = -0.001
+TIE — revise round neither helps nor hurts (round-0 already strong / saturated)

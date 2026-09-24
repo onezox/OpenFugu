@@ -1,0 +1,13 @@
+[real-train] 12 GSM8K tasks, 3 workers: ['novita/deepseek/deepseek-v4-pro', 'novita/qwen/qwen3.5-plus', 'novita/google/gemma-4-31b-it']
+[real-train] cached 12 real Qwen3-0.6B features (dim 1024)
+[baseline] per-worker solved rate: deepseek-v4-pro=0.83, qwen3.5-plus=0.92, gemma-4-31b-it=0.92
+[iter 0] best_solved=0.917  (best single worker 0.917)  cache=36
+[iter 1] best_solved=0.917  (best single worker 0.917)  cache=36
+[iter 2] best_solved=0.917  (best single worker 0.917)  cache=36
+[iter 3] best_solved=0.917  (best single worker 0.917)  cache=36
+[iter 4] best_solved=0.917  (best single worker 0.917)  cache=36
+[iter 5] best_solved=0.917  (best single worker 0.917)  cache=36
+[iter 6] best_solved=0.917  (best single worker 0.917)  cache=36
+[iter 7] best_solved=0.917  (best single worker 0.917)  cache=36
+[result] coordinator solved 0.917 vs best single worker 0.917
+[result] learned routing per task:

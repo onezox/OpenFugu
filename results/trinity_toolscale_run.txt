@@ -1,0 +1,12 @@
+[toolscale-train] 8 tasks, 3 workers: ['novita/deepseek/deepseek-v4-pro', 'novita/qwen/qwen3.5-plus', 'novita/google/gemma-4-31b-it']
+[toolscale-train] cached 8 real Qwen3-0.6B features
+[baseline] per-worker action-score: deepseek-v4-pro=0.000, qwen3.5-plus=0.142, gemma-4-31b-it=0.021
+[iter 0] best_score=0.152  (best single 0.142)  cache=24
+[iter 1] best_score=0.152  (best single 0.142)  cache=24
+[iter 2] best_score=0.152  (best single 0.142)  cache=24
+[iter 3] best_score=0.152  (best single 0.142)  cache=24
+[iter 4] best_score=0.152  (best single 0.142)  cache=24
+[iter 5] best_score=0.152  (best single 0.142)  cache=24
+[result] coordinator 0.152 vs best single worker 0.142
+[result] routing distribution: {'qwen3.5-plus': 7, 'gemma-4-31b-it': 1}
+PASS — coordinator beats best single worker on multi-domain ToolScale (orchestration value from worker complementarity)
