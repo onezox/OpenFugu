@@ -97,41 +97,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-class LocalPoolWorker:
-    """Serving-time local worker pool — the same protocol the per-step trainer
-    used. The Coordinator calls (role_name, messages, agent_id) -> reply; we
-    dispatch to model[agent_id % n], each model resident on its own GPU. Replies
-    are decoded greedily so serving is deterministic. No external API."""
-    def __init__(self, specs, max_new=384):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        self.torch, self.max_new = torch, max_new
-        self.names, self.toks, self.models, self.devs = [], [], [], []
-        for name, path, dev in specs:
-            tk = AutoTokenizer.from_pretrained(path)
-            if tk.pad_token is None:
-                tk.pad_token = tk.eos_token
-            try:
-                m = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16).to(dev).eval()
-            except TypeError:
-                m = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(dev).eval()
-            self.names.append(name); self.toks.append(tk); self.models.append(m); self.devs.append(dev)
-
-    def __call__(self, role_name, messages, agent_id):
-        torch = self.torch
-        wid = agent_id % len(self.models)
-        tk, model, dev = self.toks[wid], self.models[wid], self.devs[wid]
-        try:
-            text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            text = "\n".join(m["content"] for m in messages)
-        ids = tk(text, return_tensors="pt", truncation=True, max_length=2048).to(dev)
-        with torch.no_grad():
-            out = model.generate(**ids, max_new_tokens=self.max_new, do_sample=False,
-                                 pad_token_id=tk.pad_token_id)
-        return tk.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
-
-
 def main():
     global ROUTER, WORKER, MAX_TURNS
     ap = argparse.ArgumentParser(description="Serve Fugu as one OpenAI-compatible model.")
@@ -142,9 +107,6 @@ def main():
                     help="optional trained head-only vector (10240); overrides the "
                          "head from --vector after SVF is applied")
     ap.add_argument("--slot-models", metavar="CSV", help="litellm worker ids; omit for mock")
-    ap.add_argument("--local-models", metavar="CSV",
-                    help="local HF worker model paths (real per-step pool, no API). "
-                         "Optional 'path@device' per entry; default round-robin GPUs.")
     ap.add_argument("--port", type=int, default=8088)
     ap.add_argument("--max-turns", type=int, default=5)
     args = ap.parse_args()
@@ -160,25 +122,12 @@ def main():
             HEAD_ROWS, HIDDEN).to(ROUTER.device)
         print(f"[serve] applied trained head from {args.head}", flush=True)
 
-    if args.local_models:                          # real local worker pool (no API)
-        specs = []
-        n_gpu = ROUTER.torch.cuda.device_count() if ROUTER.torch.cuda.is_available() else 0
-        for i, entry in enumerate(args.local_models.split(",")):
-            if "@" in entry:
-                path, dev = entry.rsplit("@", 1)
-            else:
-                path = entry
-                dev = f"cuda:{(i % max(n_gpu - 1, 1)) + 1}" if n_gpu > 1 else "cpu"
-            specs.append((os.path.basename(path.rstrip("/")) or f"w{i}", path, dev))
-        WORKER = LocalPoolWorker(specs)
-        print(f"[serve] worker pool: LOCAL ({len(specs)}): "
-              f"{[n for n,_,_ in specs]}", flush=True)
-    elif args.slot_models:
+    if args.slot_models:
         WORKER = LiteLLMWorker(slot_models=args.slot_models.split(","))
         print(f"[serve] worker pool: litellm ({len(args.slot_models.split(','))} slots)", flush=True)
     else:
         WORKER = MockWorker()
-        print("[serve] worker pool: MOCK (no --slot-models / --local-models given)", flush=True)
+        print("[serve] worker pool: MOCK (no --slot-models given)", flush=True)
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"[serve] Fugu listening on :{args.port} — POST /v1/chat/completions", flush=True)
