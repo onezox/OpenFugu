@@ -1,9 +1,11 @@
-"""Conductor (ultra.py): parsing, validation, execution and the prompt."""
+"""Conductor (ultra.py): parsing, validation, the prompt, and the CLI end to end."""
 import pytest
 
-from openfugu.ultra import (ConductorExecutor, WorkflowError, conductor_prompt,
+from fakes import auth_error
+from openfugu.ultra import (ConductorExecutor, WorkflowError, conductor_prompt, main,
                             parse_workflow, validate_workflow)
 
+CONDUCTOR = "openai/conductor"
 SLOTS = "openai/w0,openai/w1,openai/w2"
 
 # The canned workflow of the former `ultra.py --self-test`.
@@ -263,3 +265,100 @@ def test_conductor_prompt_lists_the_real_pool_and_is_exact():
         "Output the three lists explicitly as 'model_id: [...]', 'subtasks: [...]', "
         "'access_list: [...]', each on its own line. You may reason first, but the three "
         "lists must appear.")}
+
+
+# ---- CLI end to end (litellm mock_response, no network) --------------------------
+@pytest.fixture
+def conductor_env(monkeypatch):
+    monkeypatch.setenv("FUGU_CONDUCTOR_MODEL", CONDUCTOR)
+    monkeypatch.setenv("FUGU_API_KEY", "test-key")
+
+
+def scripted(conductor_output):
+    """Conductor calls get `conductor_output`; worker calls name their model."""
+    def respond(kwargs):
+        if kwargs["model"] == CONDUCTOR:
+            return conductor_output
+        return f"reply from {kwargs['model']}"
+    return respond
+
+
+def run_cli(query="Sort a list", slots=SLOTS):
+    return main(["--query", query, "--slot-models", slots])
+
+
+def test_cli_parses_validates_and_executes_a_workflow(fake_llm, conductor_env, capsys):
+    fake = fake_llm(scripted(CANNED))
+    assert run_cli() == 0
+    assert [call["model"] for call in fake.calls] == [CONDUCTOR, "openai/w2", "openai/w0",
+                                                      "openai/w1"]
+    conductor_call = fake.calls[0]
+    assert conductor_call["messages"] == conductor_prompt("Sort a list", SLOTS.split(","))
+    assert (conductor_call["api_key"], conductor_call["timeout"],
+            conductor_call["max_tokens"]) == ("test-key", 120.0, 2048)
+    last_step_prompt = fake.calls[3]["messages"][0]["content"]
+    assert "<Agent 0 response>reply from openai/w0</Agent 0 response>" in last_step_prompt
+    assert "final answer (step 2 output):\nreply from openai/w1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("completion, error", [
+    (workflow_text("[0, 1]", '["a", "b"]', "[[], [1]]"), "access_list[1] = [1]"),
+    (workflow_text("[0, 1]", '["a", "b"]', "[[], [], []]"), "workflow: model_id, subtasks"),
+    (workflow_text(str([0] * 6), str(["s"] * 6), str([[]] * 6)), "workflow: has 6 steps"),
+    (workflow_text('["1"]'), "model_id[0] = '1'"),
+    (workflow_text("[7]"), "model_id[0] = 7: must be a worker index from 0 to 2"),
+    ("I would split this into three steps.", "model_id: missing"),
+], ids=["self-reference", "unequal-lengths", "six-steps", "string-id", "out-of-range",
+        "no-lists"])
+def test_cli_rejects_an_invalid_workflow_before_any_worker_call(
+        fake_llm, conductor_env, capsys, completion, error):
+    fake = fake_llm(scripted(completion))
+    assert run_cli() == 1
+    assert [call["model"] for call in fake.calls] == [CONDUCTOR]
+    stderr = capsys.readouterr().err
+    assert f"invalid workflow: {error}" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_cli_reports_missing_conductor_configuration(fake_llm, capsys):
+    fake = fake_llm([])
+    assert run_cli() == 1
+    assert fake.calls == []
+    assert ("configuration error: no Conductor model: set FUGU_CONDUCTOR_MODEL"
+            in capsys.readouterr().err)
+
+
+def test_cli_reports_a_failed_conductor_call(fake_llm, conductor_env, capsys):
+    fake = fake_llm([auth_error()])
+    assert run_cli() == 1
+    assert len(fake.calls) == 1
+    stderr = capsys.readouterr().err
+    assert "Conductor call failed: openai/conductor: AuthenticationError" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_conductor_uses_its_own_credentials(fake_llm, monkeypatch):
+    for name, value in {"FUGU_CONDUCTOR_MODEL": CONDUCTOR,
+                        "FUGU_CONDUCTOR_API_KEY": "conductor-key",
+                        "FUGU_CONDUCTOR_BASE_URL": "http://conductor.test/v1",
+                        "FUGU_API_KEY": "worker-key"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    fake = fake_llm(scripted(workflow_text()))
+    assert run_cli(slots="openai/w0") == 0
+    conductor_call, worker_call = fake.calls
+    assert (conductor_call["api_key"], conductor_call["api_base"]) == (
+        "conductor-key", "http://conductor.test/v1")
+    assert worker_call["api_key"] == "worker-key"
+    assert "api_base" not in worker_call
+
+
+@pytest.mark.parametrize("argv", [
+    ["--query", "q"],
+    ["--query", "q", "--slot-models", SLOTS, "--conductor", "openai/x"],
+    ["--self-test"],
+], ids=["no-slot-models", "removed-conductor-flag", "removed-self-test-flag"])
+def test_cli_rejects_missing_or_removed_options(argv):
+    with pytest.raises(SystemExit) as info:
+        main(argv)
+    assert info.value.code == 2

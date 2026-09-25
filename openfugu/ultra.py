@@ -12,16 +12,13 @@ Provenance, stated honestly:
           injection — follows the TRINITY/Conductor authors' conductor_engine.py
           + conductor_utils.py. Parsing and validation are stricter than theirs:
           any rule violation raises WorkflowError before a worker is called.
-  [DOC]   the GRPO-trained 7B Conductor weights are NOT public, so here the
-          Conductor is a *prompted off-the-shelf model*. The Conductor paper's
-          own claim is that prompting works (just below the RL-optimized model);
-          this reproduces the mechanism, not the trained policy.
-
-Workers (and the Conductor) run through litellm, so any provider pool works.
+  [DOC]   the Conductor is any model reached through litellm (for example a
+          fine-tuned one behind an OpenAI-compatible API), configured with the
+          FUGU_CONDUCTOR_* environment variables.
 
 Usage:
-  python openfugu/ultra.py --query "..." --conductor novita/deepseek/deepseek-v4-pro \
-      --slot-models <csv of worker model ids>
+  FUGU_CONDUCTOR_MODEL=... FUGU_API_KEY=... \
+  python -m openfugu.ultra --query "..." --slot-models <csv of worker model ids>
 """
 from __future__ import annotations
 
@@ -35,16 +32,17 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
+from openfugu.llm import (ConfigError, Endpoint, LLMCallError, check_endpoint, complete,
+                          conductor_endpoint)
+
 logger = logging.getLogger(__name__)
 
 N_AGENTS = 7
 MAX_STEPS = 5                      # [DOC] Conductor workflows up to 5 steps
-
-DEFAULT_SLOT_LABELS = [            # [DATA] training metadata; remappable to any provider
-    "gpt-5", "claude-sonnet-4", "gemini-2.5-pro",
-    "deepseek-r1-distill-qwen-32b", "gemma-3-27b-it",
-    "qwen3-32b-reasoning", "qwen3-32b-direct",
-]
+CONDUCTOR_ATTEMPTS = 3
+CONDUCTOR_TIMEOUT_S = 120.0
+CONDUCTOR_MAX_TOKENS = 2048
+CONDUCTOR_TEMPERATURE = 0.2
 
 # Accepted spellings of each list label; the first one is canonical.
 LABELS = {
@@ -247,6 +245,13 @@ def conductor_prompt(query: str, pool: Sequence[str]) -> list[dict]:
             {"role": "user", "content": f"USER QUESTION: {query}"}]
 
 
+def conduct(endpoint: Endpoint, query: str, pool: Sequence[str]) -> str:
+    """Ask the Conductor model for a workflow; returns its raw completion."""
+    return complete(endpoint, conductor_prompt(query, pool), max_tokens=CONDUCTOR_MAX_TOKENS,
+                    temperature=CONDUCTOR_TEMPERATURE, timeout=CONDUCTOR_TIMEOUT_S,
+                    attempts=CONDUCTOR_ATTEMPTS)
+
+
 # ---- execution ---------------------------------------------------------------
 WorkerFn = Callable[[str, list, int], str]   # (subtask, messages, agent_id) -> reply
 
@@ -325,33 +330,33 @@ class LiteLLMWorker:
     def __call__(self, subtask, messages, agent_id):
         return self._call(self.slot_models[agent_id % len(self.slot_models)], messages)
 
-    def conduct(self, model, messages):     # the Conductor call (more tokens)
-        old = self.max_tokens; self.max_tokens = 2048
-        try:
-            return self._call(model, messages)
-        finally:
-            self.max_tokens = old
-
 
 # ---- CLI -----------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     """Run one query: the Conductor designs a workflow, the pool executes it."""
     ap = argparse.ArgumentParser(description="Fugu-Ultra: a Conductor designs a workflow, "
                                              "the worker pool executes it.")
-    ap.add_argument("--query")
-    ap.add_argument("--conductor", help="litellm model id acting as the Conductor")
-    ap.add_argument("--slot-models", metavar="CSV", help="litellm worker model ids")
+    ap.add_argument("--query", required=True)
+    ap.add_argument("--slot-models", metavar="CSV", required=True,
+                    help="comma-separated litellm worker model ids; worker i is entry i")
     args = ap.parse_args(argv)
-    if not args.query or not args.conductor:
-        ap.error("need --query and --conductor")
+    pool = args.slot_models.split(",")
 
-    slots = args.slot_models.split(",") if args.slot_models else None
-    worker = LiteLLMWorker(slot_models=slots)
-    pool = slots or DEFAULT_SLOT_LABELS
-    print(f"workers: litellm ({len(pool)} slots)")
-    print(f"conductor: {args.conductor}")
+    try:
+        endpoint = conductor_endpoint()
+        check_endpoint(endpoint, "Conductor")
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 1
+    print(f"conductor: {endpoint.model}")
+    print(f"workers: {len(pool)} slots")
     print(f"query: {args.query}\n")
-    completion = worker.conduct(args.conductor, conductor_prompt(args.query, pool))
+
+    try:
+        completion = conduct(endpoint, args.query, pool)
+    except LLMCallError as exc:
+        print(f"Conductor call failed: {exc}", file=sys.stderr)
+        return 1
     try:
         workflow = validate_workflow(*parse_workflow(completion), pool_size=len(pool))
     except WorkflowError as exc:
@@ -361,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"workflow: model_id={workflow.model_ids}  access_list={workflow.access_list}"
           f"  ({len(workflow.subtasks)} steps)\n")
-    res = ConductorExecutor(worker).execute(workflow)
+    res = ConductorExecutor(LiteLLMWorker(slot_models=pool)).execute(workflow)
     for step in res.steps:
         print(f"  step {step.idx}: agent={step.agent_id} ({pool[step.agent_id]}) "
               f"sees={step.sees}")

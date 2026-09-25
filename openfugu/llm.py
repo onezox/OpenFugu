@@ -69,19 +69,35 @@ def _first_env(*names: str) -> str | None:
     return next((value for value in map(_env, names) if value), None)
 
 
+def _endpoint(purpose: str, prefixes: tuple[str, ...]) -> Endpoint:
+    """Build an endpoint from {prefix}_MODEL, _API_KEY and _BASE_URL, trying the
+    prefixes in order; the key and base URL finally fall back to the worker
+    settings FUGU_API_KEY and FUGU_BASE_URL."""
+    model_vars = [f"{prefix}_MODEL" for prefix in prefixes]
+    model = _first_env(*model_vars)
+    if not model:
+        raise ConfigError(f"no {purpose} model: set {' or '.join(model_vars)}")
+    return Endpoint(
+        model=model,
+        api_key=_first_env(*(f"{prefix}_API_KEY" for prefix in prefixes), "FUGU_API_KEY"),
+        api_base=_first_env(*(f"{prefix}_BASE_URL" for prefix in prefixes), "FUGU_BASE_URL"),
+    )
+
+
 def router_endpoint() -> Endpoint:
     """Router endpoint: FUGU_ROUTER_* settings, each falling back to FUGU_CONDUCTOR_*.
 
     The key and base URL fall back further to FUGU_API_KEY and FUGU_BASE_URL.
     """
-    model = _first_env("FUGU_ROUTER_MODEL", "FUGU_CONDUCTOR_MODEL")
-    if not model:
-        raise ConfigError("no router model: set FUGU_ROUTER_MODEL or FUGU_CONDUCTOR_MODEL")
-    return Endpoint(
-        model=model,
-        api_key=_first_env("FUGU_ROUTER_API_KEY", "FUGU_CONDUCTOR_API_KEY", "FUGU_API_KEY"),
-        api_base=_first_env("FUGU_ROUTER_BASE_URL", "FUGU_CONDUCTOR_BASE_URL", "FUGU_BASE_URL"),
-    )
+    return _endpoint("router", ("FUGU_ROUTER", "FUGU_CONDUCTOR"))
+
+
+def conductor_endpoint() -> Endpoint:
+    """Conductor endpoint: FUGU_CONDUCTOR_* settings.
+
+    The key and base URL fall back to FUGU_API_KEY and FUGU_BASE_URL.
+    """
+    return _endpoint("Conductor", ("FUGU_CONDUCTOR",))
 
 
 def check_endpoint(endpoint: Endpoint, purpose: str) -> None:

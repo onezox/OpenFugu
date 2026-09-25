@@ -3,7 +3,7 @@ import pytest
 
 from fakes import auth_error, rate_limit_error
 from openfugu.llm import (ConfigError, Endpoint, LLMCallError, check_endpoint, complete,
-                          router_endpoint)
+                          conductor_endpoint, router_endpoint)
 
 MESSAGES = [{"role": "user", "content": "hi"}]
 ENDPOINT = Endpoint("openai/test-model", api_key="test-key")
@@ -43,6 +43,27 @@ def test_blank_variables_count_as_unset(monkeypatch):
 def test_missing_router_model_is_a_config_error():
     with pytest.raises(ConfigError, match="FUGU_ROUTER_MODEL or FUGU_CONDUCTOR_MODEL"):
         router_endpoint()
+
+
+def test_conductor_endpoint_falls_back_to_worker_settings(monkeypatch):
+    set_env(monkeypatch, FUGU_CONDUCTOR_MODEL="openai/conductor", FUGU_API_KEY="worker-key",
+            FUGU_BASE_URL="http://workers.test/v1")
+    assert conductor_endpoint() == Endpoint("openai/conductor", "worker-key",
+                                            "http://workers.test/v1")
+
+
+def test_conductor_settings_take_precedence_and_ignore_router_settings(monkeypatch):
+    set_env(monkeypatch, FUGU_ROUTER_MODEL="openai/router", FUGU_ROUTER_API_KEY="router-key",
+            FUGU_CONDUCTOR_MODEL="openai/conductor", FUGU_CONDUCTOR_API_KEY="conductor-key",
+            FUGU_CONDUCTOR_BASE_URL="http://conductor.test/v1", FUGU_API_KEY="worker-key")
+    assert conductor_endpoint() == Endpoint("openai/conductor", "conductor-key",
+                                            "http://conductor.test/v1")
+
+
+def test_missing_conductor_model_is_a_config_error(monkeypatch):
+    set_env(monkeypatch, FUGU_ROUTER_MODEL="openai/router")
+    with pytest.raises(ConfigError, match="no Conductor model: set FUGU_CONDUCTOR_MODEL$"):
+        conductor_endpoint()
 
 
 def test_endpoint_repr_hides_the_key():
