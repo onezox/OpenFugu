@@ -227,11 +227,6 @@ class WorkerPool:
         litellm's own provider variables apply."""
         return cls(slot_models, _env("FUGU_API_KEY"), _env("FUGU_BASE_URL"))
 
-    @property
-    def slot_models(self) -> list[str]:
-        """The model id of each agent slot, in agent-id order."""
-        return [endpoint.model for endpoint in self.endpoints]
-
     def __len__(self) -> int:
         return len(self.endpoints)
 

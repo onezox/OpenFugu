@@ -122,8 +122,7 @@ def _json_objects(text: str) -> Iterator[dict]:
         except json.JSONDecodeError:
             start = text.find("{", start + 1)
             continue
-        if isinstance(value, dict):
-            yield value
+        yield value                            # decoding began at "{", so it is a dict
         start = text.find("{", end)
 
 
