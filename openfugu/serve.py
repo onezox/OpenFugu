@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # OpenFugu — Apache-2.0. Part of an independent, open reimplementation of
 # the Fugu orchestrator. NOT affiliated with Sakana AI. See NOTICE.
 # Reference: OpenAI-compatible serving layer for the OpenFugu TRINITY coordinator. Original code.
@@ -7,35 +6,71 @@ serve.py — Fugu as a single OpenAI-compatible model endpoint.
 
 This is Fugu's real product surface: "one model to command them all". A client
 POSTs to /v1/chat/completions as if calling one model; internally the TRINITY
-coordinator (Qwen3-0.6B + model_iter_60.npy) routes each turn to a worker from a
-real pool (via litellm) and runs the step_trinity loop until a verifier accepts.
-The caller never sees the pool.
+coordinator asks an API router model which worker of the pool acts next, and
+runs the step_trinity loop until a verifier accepts. The caller never sees the
+pool.
 
 stdlib http.server only — no FastAPI/uvicorn (ponytail: a router endpoint needs
-a socket and a JSON handler, not a web framework).
+a socket and a JSON handler, not a web framework). The server listens on
+127.0.0.1 unless --host says otherwise, and has no authentication; put a
+reverse proxy in front of it to expose it.
 
 Run:
-  FUGU_API_KEY=... FUGU_BASE_URL=... \
-  python serve.py --model <qwen3-0.6b dir> --vector model_iter_60.npy \
-                  --slot-models <csv of litellm worker ids> --port 8088
+  FUGU_CONDUCTOR_MODEL=... FUGU_API_KEY=... FUGU_BASE_URL=... \
+  python -m openfugu.serve --slot-models <csv of litellm worker ids> --port 8088
 
 Query:
   curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"..."}]}'
 """
 from __future__ import annotations
-import argparse, glob, json, os, sys, time, uuid
-import numpy as np
+
+import argparse
+import json
+import logging
+import socket
+import sys
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# reuse the faithful implementation
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mini import (FuguRouter, Coordinator, LiteLLMWorker, MockWorker,
-                  DEFAULT_SLOT_LABELS, HEAD_ROWS, HIDDEN)
+from openfugu.llm import (ConfigError, LLMCallError, WorkerPool, check_endpoint,
+                          configure_logging, parse_slot_models, router_endpoint)
+from openfugu.mini import MAX_TURNS, ApiRouter, Coordinator
 
-ROUTER: FuguRouter | None = None
-WORKER = None
+logger = logging.getLogger("openfugu.serve")
+
 MODEL_NAME = "fugu"
-MAX_TURNS = 5
+DEFAULT_HOST = "127.0.0.1"
+LINGER_S = 5.0          # longest wait for a client to finish sending before a close
+
+
+class BadRequest(ValueError):
+    """The request body is malformed; the message is returned as a 400 error."""
+
+
+def _message_text(content: object) -> str:
+    """A message's text: a string, or the text parts of an OpenAI content-part
+    list joined by newlines (other part types, such as images, are skipped)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part["text"] for part in content
+                         if isinstance(part, dict) and part.get("type") == "text"
+                         and isinstance(part.get("text"), str))
+    raise BadRequest("message content must be a string or a list of content parts")
+
+
+def _user_query(request: object) -> str:
+    """The text of the last user message; the coordinator answers this query."""
+    if not isinstance(request, dict):
+        raise BadRequest("request body must be a JSON object")
+    messages = request.get("messages", [])
+    if not messages:
+        raise BadRequest("messages required")
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        raise BadRequest("messages must be a list of message objects")
+    user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    return _message_text(user.get("content")) if user else ""
 
 
 def _chat_response(text: str, model: str, usage_turns: int) -> dict:
@@ -54,136 +89,159 @@ def _chat_response(text: str, model: str, usage_turns: int) -> dict:
     }
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+class FuguServer(ThreadingHTTPServer):
+    """HTTP server that holds the router, worker pool and turn budget for its handlers."""
 
-    def _send(self, code: int, body: dict):
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], router: ApiRouter, workers: WorkerPool,
+                 max_turns: int = MAX_TURNS) -> None:
+        super().__init__(address, Handler)
+        self.router, self.workers, self.max_turns = router, workers, max_turns
+
+    def shutdown_request(self, request: socket.socket) -> None:
+        """Close a connection without losing the last response.
+
+        Closing a socket that still holds unread input, such as a request body
+        the handler did not read, makes TCP reset the connection, and the reset
+        can destroy the response before the client reads it. So the server
+        sends its FIN first, then reads and discards whatever the client still
+        sends until the client closes or LINGER_S passes, and only then closes.
+        """
+        deadline = time.monotonic() + LINGER_S
+        try:
+            request.shutdown(socket.SHUT_WR)
+            while (remaining := deadline - time.monotonic()) > 0:
+                request.settimeout(remaining)
+                if not request.recv(65536):
+                    break
+        except OSError:                                 # timed out, reset or already closed
+            pass
+        self.close_request(request)
+
+
+class Handler(BaseHTTPRequestHandler):
+    """Serves /v1/chat/completions, /v1/models and /health."""
+
+    protocol_version = "HTTP/1.1"
+    server: FuguServer
+
+    def _send(self, code: int, body: dict, *, close: bool = False):
+        """Send a JSON response. `close` ends the connection after it; a response
+        must close when the request body was not read in full, or the unread
+        bytes would be parsed as the next request on this keep-alive connection."""
         data = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        if close:
+            self.send_header("Connection", "close")      # also sets self.close_connection
         self.end_headers()
         self.wfile.write(data)
 
+    def _has_body(self) -> bool:
+        """Whether the request declares a body: chunked, or a Content-Length other than 0."""
+        return ("Transfer-Encoding" in self.headers
+                or self.headers.get("Content-Length", "0").strip() != "0")
+
     def do_GET(self):
+        close = self._has_body()                        # a GET body is never read
         if self.path == "/v1/models":
             self._send(200, {"object": "list", "data": [
-                {"id": MODEL_NAME, "object": "model", "owned_by": "openfugu"}]})
+                {"id": MODEL_NAME, "object": "model", "owned_by": "openfugu"}]}, close=close)
         elif self.path in ("/health", "/"):
-            self._send(200, {"status": "ok", "model": MODEL_NAME})
+            self._send(200, {"status": "ok", "model": MODEL_NAME}, close=close)
         else:
-            self._send(404, {"error": "not found"})
+            self._send(404, {"error": "not found"}, close=close)
 
     def do_POST(self):
         if self.path.rstrip("/") != "/v1/chat/completions":
-            self._send(404, {"error": "not found"}); return
+            self._send(404, {"error": "not found"}, close=self._has_body()); return
+        if "Transfer-Encoding" in self.headers:         # http.server cannot decode chunked bodies
+            self._send(411, {"error": "Content-Length required; Transfer-Encoding is not "
+                                      "supported"}, close=True); return
         try:
-            n = int(self.headers.get("Content-Length", 0))
+            # Several Content-Length headers make the body length ambiguous.
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) > 1:
+                raise ValueError("several Content-Length headers")
+            n = int(lengths[0]) if lengths else 0
+            if n < 0:
+                raise ValueError("negative Content-Length")
+        except ValueError:
+            self._send(400, {"error": "invalid JSON body"}, close=True); return
+        try:
             req = json.loads(self.rfile.read(n) or b"{}")
-            messages = req.get("messages", [])
-            if not messages:
-                self._send(400, {"error": "messages required"}); return
-            # the user query = last user message; coordinator runs the full loop
-            query = next((m["content"] for m in reversed(messages)
-                          if m.get("role") == "user"), "")
-            coord = Coordinator(ROUTER, WORKER, max_turns=MAX_TURNS, sample=True)
-            res = coord.run(query, verbose=False)
-            self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME),
-                                           len(res.turns)))
-        except Exception as e:
-            self._send(500, {"error": str(e)})
-
-    def log_message(self, *a):       # quiet
-        pass
-
-
-class LocalPoolWorker:
-    """Serving-time local worker pool — the same protocol the per-step trainer
-    used. The Coordinator calls (role_name, messages, agent_id) -> reply; we
-    dispatch to model[agent_id % n], each model resident on its own GPU. Replies
-    are decoded greedily so serving is deterministic. No external API."""
-    def __init__(self, specs, max_new=384):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        self.torch, self.max_new = torch, max_new
-        self.names, self.toks, self.models, self.devs = [], [], [], []
-        for name, path, dev in specs:
-            tk = AutoTokenizer.from_pretrained(path)
-            if tk.pad_token is None:
-                tk.pad_token = tk.eos_token
-            try:
-                m = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16).to(dev).eval()
-            except TypeError:
-                m = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(dev).eval()
-            self.names.append(name); self.toks.append(tk); self.models.append(m); self.devs.append(dev)
-
-    def __call__(self, role_name, messages, agent_id):
-        torch = self.torch
-        wid = agent_id % len(self.models)
-        tk, model, dev = self.toks[wid], self.models[wid], self.devs[wid]
+        except ValueError:
+            self._send(400, {"error": "invalid JSON body"}); return
         try:
-            text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            query = _user_query(req)      # last user message; the coordinator runs the full loop
+        except BadRequest as exc:
+            self._send(400, {"error": str(exc)}); return
+        try:
+            coord = Coordinator(self.server.router, self.server.workers,
+                                max_turns=self.server.max_turns)
+            res = coord.run(query)
+        except LLMCallError as exc:            # expected: a model call failed after retries
+            logger.error("POST /v1/chat/completions failed: %s", exc)
+            self._send(500, {"error": "internal server error"}); return
         except Exception:
-            text = "\n".join(m["content"] for m in messages)
-        ids = tk(text, return_tensors="pt", truncation=True, max_length=2048).to(dev)
-        with torch.no_grad():
-            out = model.generate(**ids, max_new_tokens=self.max_new, do_sample=False,
-                                 pad_token_id=tk.pad_token_id)
-        return tk.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
+            logger.exception("POST /v1/chat/completions failed")
+            self._send(500, {"error": "internal server error"}); return
+        self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME), len(res.turns)))
+
+    def log_message(self, format: str, *args) -> None:
+        """Route http.server's access log to the logging module (DEBUG)."""
+        logger.debug("%s - " + format, self.address_string(), *args)
 
 
-def main():
-    global ROUTER, WORKER, MAX_TURNS
+def main(argv: list[str] | None = None) -> int:
+    """Validate the configuration, then serve until interrupted."""
     ap = argparse.ArgumentParser(description="Serve Fugu as one OpenAI-compatible model.")
-    ap.add_argument("--model", required=True, help="Qwen3-0.6B dir")
-    ap.add_argument("--vector", default="model_iter_60.npy",
-                    help="base vector (19456) — SVF + head")
-    ap.add_argument("--head", default=None,
-                    help="optional trained head-only vector (10240); overrides the "
-                         "head from --vector after SVF is applied")
-    ap.add_argument("--slot-models", metavar="CSV", help="litellm worker ids; omit for mock")
-    ap.add_argument("--local-models", metavar="CSV",
-                    help="local HF worker model paths (real per-step pool, no API). "
-                         "Optional 'path@device' per entry; default round-robin GPUs.")
+    ap.add_argument("--slot-models", metavar="CSV", required=True,
+                    help="comma-separated litellm worker model ids, one per agent slot")
+    ap.add_argument("--host", default=DEFAULT_HOST,
+                    help=f"IPv4 address or hostname to listen on (default {DEFAULT_HOST}; "
+                         f"the server has no authentication, so expose it only behind a "
+                         f"reverse proxy)")
     ap.add_argument("--port", type=int, default=8088)
-    ap.add_argument("--max-turns", type=int, default=5)
-    args = ap.parse_args()
-    MAX_TURNS = args.max_turns
+    ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
+    args = ap.parse_args(argv)
+    if not args.host.strip():
+        ap.error("--host must not be empty")
+    if not 0 < args.port < 65536:
+        ap.error("--port must be between 1 and 65535")
+    if args.max_turns < 1:
+        ap.error("--max-turns must be at least 1")
+    configure_logging(logging.INFO)
 
-    print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
-    ROUTER = FuguRouter(args.model, args.vector, seed=0)
-    if args.head:                                  # layer a trained head over base SVF
-        h = np.load(args.head).astype(np.float64)
-        if h.shape != (HEAD_ROWS * HIDDEN,):
-            raise ValueError(f"--head must be {HEAD_ROWS * HIDDEN} floats, got {h.shape}")
-        ROUTER.head = ROUTER.torch.from_numpy(h.copy()).float().reshape(
-            HEAD_ROWS, HIDDEN).to(ROUTER.device)
-        print(f"[serve] applied trained head from {args.head}", flush=True)
+    try:
+        slot_models = parse_slot_models(args.slot_models)
+        workers = WorkerPool.from_env(slot_models)
+        workers.check()
+        endpoint = router_endpoint()
+        check_endpoint(endpoint, "router")
+    except ConfigError as exc:
+        logger.error("configuration error: %s", exc)
+        return 1
+    router = ApiRouter(endpoint, slot_models)
 
-    if args.local_models:                          # real local worker pool (no API)
-        specs = []
-        n_gpu = ROUTER.torch.cuda.device_count() if ROUTER.torch.cuda.is_available() else 0
-        for i, entry in enumerate(args.local_models.split(",")):
-            if "@" in entry:
-                path, dev = entry.rsplit("@", 1)
-            else:
-                path = entry
-                dev = f"cuda:{(i % max(n_gpu - 1, 1)) + 1}" if n_gpu > 1 else "cpu"
-            specs.append((os.path.basename(path.rstrip("/")) or f"w{i}", path, dev))
-        WORKER = LocalPoolWorker(specs)
-        print(f"[serve] worker pool: LOCAL ({len(specs)}): "
-              f"{[n for n,_,_ in specs]}", flush=True)
-    elif args.slot_models:
-        WORKER = LiteLLMWorker(slot_models=args.slot_models.split(","))
-        print(f"[serve] worker pool: litellm ({len(args.slot_models.split(','))} slots)", flush=True)
-    else:
-        WORKER = MockWorker()
-        print("[serve] worker pool: MOCK (no --slot-models / --local-models given)", flush=True)
-
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"[serve] Fugu listening on :{args.port} — POST /v1/chat/completions", flush=True)
-    srv.serve_forever()
+    try:
+        server = FuguServer((args.host, args.port), router, workers, args.max_turns)
+    except OSError as exc:
+        logger.error("cannot listen on %s:%d: %s", args.host, args.port, exc)
+        return 1
+    logger.info("router: %s", endpoint.model)
+    logger.info("worker pool (%d): %s", len(workers), ", ".join(slot_models))
+    logger.info("Fugu listening on %s:%d - POST /v1/chat/completions", args.host, args.port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("shutting down")
+    finally:
+        server.server_close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

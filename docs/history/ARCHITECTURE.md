@@ -1,3 +1,5 @@
+> **Historical background — not the current runtime; see tag [`pre-api-only`](https://github.com/onezox/OpenFugu/tree/pre-api-only).**
+
 # Sakana Fugu — Reverse-Engineered Architecture
 
 > Twelve rounds of investigation across 3 papers, 4 repos, 1 PDF report, and

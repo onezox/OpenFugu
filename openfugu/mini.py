@@ -1,60 +1,65 @@
-#!/usr/bin/env python3
 # OpenFugu — Apache-2.0. Part of an independent, open reimplementation of
 # the Fugu orchestrator. NOT affiliated with Sakana AI. See NOTICE.
-# Reference: TRINITY: An Evolved LLM Coordinator (arXiv:2512.04695, Sakana AI). Independent reimplementation from the paper + the authors' released checkpoint; no Sakana source code is copied.
+# Reference: TRINITY: An Evolved LLM Coordinator (arXiv:2512.04695, Sakana AI). Independent reimplementation from the paper + the authors' released code; no Sakana source code is copied.
 """
-fugu_mini.py — a faithful, minimal, runnable reconstruction of Sakana Fugu's
-inference path (the TRINITY line), built entirely from reverse-engineered
-constants that were verified end-to-end against the released `model_iter_60.npy`
-checkpoint (95% agent / 100% role on a 37-case fixture).
+mini.py — TRINITY-style multi-turn coordination with an API router.
 
-This is the *implementation*, not a verification script: it exposes a clean
-`FuguRouter` (hidden-state -> worker/role logits) and a `Coordinator` (the full
-multi-turn step_trinity loop with role injection, worker dispatch, and
-verifier/max-turn termination). Worker LLMs are pluggable; a MockWorker lets the
-whole loop run offline with no API keys.
+Each turn an `ApiRouter` asks a router model, reached through litellm, which
+agent of the worker pool acts next and in which role (solver, thinker or
+verifier). The `Coordinator` dispatches the turn to that worker, feeds solver
+thoughts back into the router's observation, and stops when a verifier
+ACCEPTs or the turn budget runs out.
 
-Every non-obvious constant is annotated with how it was established:
-  [EXEC]  reproduced by running real weights
-  [CODE]  read from the TRINITY authors' code submission
-  [DATA]  from the released training log / checkpoint
-
-Usage:
-  python fugu_mini.py --self-test            # re-run the 37-case fixture, assert faithfulness
-  python fugu_mini.py --demo                 # run the coordination loop with a mock worker pool
-  python fugu_mini.py --route "your prompt"  # one routing decision
-
-Requires: torch, transformers, numpy, and a local Qwen3-0.6B + model_iter_60.npy.
-Paths are overridable via --model / --vector / --fixture or the env vars
-FUGU_MODEL / FUGU_VECTOR / FUGU_FIXTURE.
+The coordination loop and the worker prompts follow the TRINITY authors'
+step_trinity (core.py) [CODE]. The router replaces the paper's hidden-state
+head: a fine-tuned model answers {"agent_id": <int>, "role": <role>}.
 """
 from __future__ import annotations
-import argparse, json, os, sys
+
+import json
+import logging
+import re
+import time
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TypedDict
 
-import numpy as np
+from openfugu.llm import Endpoint, LLMCallError, backoff_delay, complete
 
-# ---- verified structural constants ------------------------------------------
-HIDDEN = 1024              # [EXEC] Qwen3-0.6B hidden size
-N_AGENTS = 7               # [DATA] es_log.json: 7-model worker pool
-N_ROLES = 3                # [CODE] solver/thinker/verifier
-HEAD_ROWS = N_AGENTS + N_ROLES        # 10
-SVF_LEN = 9 * HIDDEN                   # 9216  [EXEC] 9 matrices x 1024 singular values
-HEAD_LEN = HEAD_ROWS * HIDDEN          # 10240
-VEC_LEN = SVF_LEN + HEAD_LEN           # 19456 [EXEC] exact length of model_iter_60.npy
-HIDDEN_POS = -2            # [EXEC] penultimate-token hidden state
-OPT_LAYER = 26            # [DATA] es_log.json opt_layer_indices=[26]
+logger = logging.getLogger(__name__)
+
 MAX_TURNS = 5             # [DATA] es_log.json max_turns=5
-ROLE_NAMES = ["Worker", "Thinker", "Verifier"]   # [CODE] index order (Python: solver/thinker/verifier)
 
-# The router conditions on its OWN system prompt + the evolving question;
-# workers share the assistant SYSTEM_PROMPT. Verbatim from core.py. [CODE/FB]
+# Router vocabulary (what the router model emits) -> Coordinator role names.
+ROLE_NAMES = {"solver": "Worker", "thinker": "Thinker", "verifier": "Verifier"}
+ROUTER_ROLES = {name: role for role, name in ROLE_NAMES.items()}
+
+ROUTER_ATTEMPTS = 3        # router calls per turn before falling back
+ROUTER_TIMEOUT_S = 30.0
+ROUTER_MAX_TOKENS = 256
+ROUTER_TEMPERATURE = 0.0   # deterministic; the <state> line keeps turns distinct
+
+# The router's system prompt; {roster} lists the allowed agents as "id: model".
 ROUTER_SYSTEM_PROMPT = (
-    "You are a message dispatcher whose job is to coordinate {num_agents} agents "
-    "to solve a problem. You check the problem and the discussion history and then "
-    "decide which agent should respond next. Your first generated token's hidden "
-    "state will be used as signal for decision making.")
+    "You are a message dispatcher that coordinates a pool of agents to solve a problem. "
+    "Read the problem, the reference thoughts from earlier solver turns and the <state> "
+    "line, then decide which agent acts next and in which role.\n\n"
+    "Agents (agent_id: model):\n"
+    "{roster}\n\n"
+    "Roles:\n"
+    "- solver: writes a complete answer to the problem.\n"
+    "- thinker: analyses the problem and the current answer, then suggests how to improve it.\n"
+    "- verifier: reviews the current answer and replies ACCEPT or REJECT. An ACCEPT ends the run.\n\n"
+    "The <state> line gives the turn number (starting at 0), the role that acted on the "
+    "previous turn, and the verifier's verdict on the current answer (none if it has not "
+    "been reviewed since it was written).\n\n"
+    "Reply with only this JSON object and nothing else:\n"
+    '{"agent_id": <an agent_id from the list above>, "role": "<solver|thinker|verifier>"}')
+
+# Sent as a user turn after an invalid router reply; {reason} explains what was wrong.
+ROUTER_CORRECTION_PROMPT = (
+    "Your reply was invalid: {reason}. Reply with only the JSON object "
+    '{"agent_id": <id>, "role": "<solver|thinker|verifier>"} using an agent_id from the list.')
 
 # All three WORKER roles SHARE one system prompt; the role distinction is in how
 # the USER message is constructed, not in the system prompt. Verbatim from core.py
@@ -92,183 +97,146 @@ VERIFICATION_PROMPT = (
     "Be critical and thorough in your evaluation.")
 
 
-def _resolve(path_arg, env, default):
-    return path_arg or os.environ.get(env) or default
+# ---- router -----------------------------------------------------------------
+class RouteError(ValueError):
+    """A router reply is not a valid decision; the message is shown to the model on retry."""
 
 
-# ---- router core ------------------------------------------------------------
-class FuguRouter:
-    """Qwen3-0.6B backbone + SVF adaptation + bias-free linear head.
+class RouteDecision(TypedDict):
+    """One routing decision. `role_name` is "Worker", "Thinker" or "Verifier"."""
 
-    route(messages) -> dict(agent_id, role_id, role_name, agent_logits, role_logits)
-    The backbone's own text output is never used; only the head logits matter,
-    which is what makes a routing decision ~one forward pass. [EXEC]
+    agent_id: int
+    role_name: str
+
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+def _json_objects(text: str) -> Iterator[dict]:
+    """Yield every top-level JSON object embedded in `text`, in order."""
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            start = text.find("{", start + 1)
+            continue
+        yield value                            # decoding began at "{", so it is a dict
+        start = text.find("{", end)
+
+
+def parse_route(reply: str, allowed: Sequence[int]) -> tuple[int, str]:
+    """Extract `(agent_id, role)` from a router reply.
+
+    Accepts bare JSON, JSON in a code fence, or JSON inside prose. <think>
+    blocks are ignored, and the last object holding both keys wins. Extra keys
+    are ignored and the role is case-insensitive. `agent_id` must be a JSON
+    integer in `allowed`. Raises `RouteError` otherwise.
+    """
+    candidates = [obj for obj in _json_objects(_THINK_BLOCK.sub("", reply))
+                  if "agent_id" in obj and "role" in obj]
+    if not candidates:
+        raise RouteError('no JSON object with "agent_id" and "role" found')
+    agent_id, role = candidates[-1]["agent_id"], candidates[-1]["role"]
+    if isinstance(agent_id, bool) or not isinstance(agent_id, int):
+        raise RouteError("agent_id must be an integer")
+    if agent_id not in allowed:
+        raise RouteError(f"agent_id {agent_id} is not in the list")
+    if not isinstance(role, str) or role.strip().lower() not in ROLE_NAMES:
+        raise RouteError("role must be one of solver, thinker, verifier")
+    return agent_id, role.strip().lower()
+
+
+def allowed_agents(pool_size: int, agent_mask: Sequence[bool] | None) -> list[int]:
+    """Pool indices the router may choose: all of them, or those the mask offers."""
+    if agent_mask is None:
+        return list(range(pool_size))
+    if len(agent_mask) != pool_size:
+        raise ValueError(f"agent_mask has {len(agent_mask)} entries but the pool has "
+                         f"{pool_size} agents")
+    allowed = [i for i, offered in enumerate(agent_mask) if offered]
+    if not allowed:
+        raise ValueError("agent_mask allows no agents")
+    return allowed
+
+
+def router_state(turn: int, last_role: str | None, last_verdict: str | None) -> str:
+    """The <state> line appended to the router observation every turn."""
+    return (f"<state>turn={turn} last_role={last_role or 'none'} "
+            f"last_verdict={last_verdict or 'none'}</state>")
+
+
+def router_messages(pool: Sequence[str], allowed: Sequence[int], observation: str,
+                    state: str) -> list[dict]:
+    """The exact [system, user] messages the router model receives for one turn."""
+    roster = "\n".join(f"{i}: {pool[i]}" for i in allowed)
+    return [{"role": "system", "content": ROUTER_SYSTEM_PROMPT.replace("{roster}", roster)},
+            {"role": "user", "content": f"{observation}\n{state}"}]
+
+
+class ApiRouter:
+    """Chooses the next (agent, role) by asking a router model through litellm.
+
+    The model must answer {"agent_id": <int>, "role": "solver"|"thinker"|"verifier"}.
+    An invalid answer is retried with a correction message, and a transient
+    call failure is retried after a backoff, for at most `ROUTER_ATTEMPTS`
+    calls per turn. If none yields a valid decision, the router falls back to
+    the first allowed agent as solver and logs a warning; `route` never raises
+    for a model or network failure.
     """
 
-    def __init__(self, model_dir: str, vector_path: str, dtype="float32",
-                 device: str | None = None, seed: int | None = None):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        self.torch = torch
-        self.rng = np.random.default_rng(seed)
+    def __init__(self, endpoint: Endpoint, pool: Sequence[str]) -> None:
+        if not pool:
+            raise ValueError("the worker pool is empty")
+        self.endpoint = endpoint
+        self.pool = list(pool)
 
-        vec = np.load(vector_path).astype(np.float64)
-        if vec.shape != (VEC_LEN,):
-            raise ValueError(f"router vector must be {VEC_LEN} floats, got {vec.shape}")
+    def route(self, messages: list[dict],
+              agent_mask: Sequence[bool] | None = None) -> RouteDecision:
+        """Decide the next turn for `messages`, as built by `router_messages`."""
+        allowed = allowed_agents(len(self.pool), agent_mask)
+        conversation = list(messages)
+        for attempt in range(1, ROUTER_ATTEMPTS + 1):
+            try:
+                reply = complete(self.endpoint, conversation, max_tokens=ROUTER_MAX_TOKENS,
+                                 temperature=ROUTER_TEMPERATURE, timeout=ROUTER_TIMEOUT_S,
+                                 attempts=1)
+            except LLMCallError as exc:
+                if not exc.retryable:
+                    logger.error("router call failed: %s", exc)
+                    break
+                logger.warning("router call failed (attempt %d/%d): %s",
+                               attempt, ROUTER_ATTEMPTS, exc)
+                if attempt < ROUTER_ATTEMPTS:
+                    time.sleep(backoff_delay(attempt))
+                continue
+            try:
+                agent_id, role = parse_route(reply, allowed)
+            except RouteError as exc:
+                logger.warning("router reply rejected (attempt %d/%d): %s",
+                               attempt, ROUTER_ATTEMPTS, exc)
+                correction = ROUTER_CORRECTION_PROMPT.replace("{reason}", str(exc))
+                conversation = [*messages, {"role": "assistant", "content": reply},
+                                {"role": "user", "content": correction}]
+                continue
+            return {"agent_id": agent_id, "role_name": ROLE_NAMES[role]}
+        logger.warning("router gave no valid decision; falling back to agent %d as solver",
+                       allowed[0])
+        return {"agent_id": allowed[0], "role_name": ROLE_NAMES["solver"]}
 
-        self.tok = AutoTokenizer.from_pretrained(model_dir)
-        # transformers >=5 uses dtype=, <5 uses torch_dtype= — support both
-        td = getattr(torch, dtype)
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=td).eval()
-        except TypeError:
-            self.model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=td).eval()
-        if device:
-            self.model.to(device)
-        self.device = next(self.model.parameters()).device
-
-        self._apply_svf(vec[:SVF_LEN])
-        # head: last 10240 -> (10, 1024) [EXEC]
-        self.head = torch.from_numpy(vec[SVF_LEN:].copy()).float().reshape(HEAD_ROWS, HIDDEN).to(self.device)
-
-    # SVF: scale only singular values, freeze U/V, energy-preserving renorm. [CODE]
-    # Matrices consumed in state_dict order: embed_tokens, layer-26 {q,k,v,o,
-    # gate,up,down}, lm_head — exactly 9 x 1024 = 9216 offsets. [EXEC]
-    def _apply_svf(self, offsets: np.ndarray):
-        torch = self.torch
-        sd = self.model.state_dict()
-        keys = [k for k in sd
-                if sd[k].ndim == 2 and min(sd[k].shape) > 1
-                and ("model.layers." not in k or f"model.layers.{OPT_LAYER}." in k)]
-        off = 0
-        with torch.no_grad():
-            for k in keys:
-                W = sd[k].float()
-                U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-                n = S.numel()
-                scale = torch.from_numpy(offsets[off:off + n].copy()).float().to(W.device) + 1.0
-                off += n
-                sS = S * scale
-                newW = (U @ torch.diag(sS) @ Vh) * (S.sum() / sS.sum())
-                sd[k].copy_(newW.to(sd[k].dtype))
-        if off != SVF_LEN:
-            raise RuntimeError(f"consumed {off} SVF offsets, expected {SVF_LEN} "
-                               f"(model may not be Qwen3-0.6B)")
-        self.svf_keys = keys
-
-    @staticmethod
-    def format_transcript(messages: list[dict]) -> str:
-        # raw 'role: content', NOT a chat template — proven decisive (95% vs 11%). [EXEC]
-        return "\n".join(f'{m["role"]}: {m["content"]}' for m in messages)
-
-    def _hidden(self, messages):
-        torch = self.torch
-        text = self.format_transcript(messages)
-        ids = self.tok(text, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            out = self.model.model(**ids)          # backbone only; LM head unused
-        return out.last_hidden_state[0, HIDDEN_POS, :]
-
-    def _pick(self, logits, sample: bool):
-        torch = self.torch
-        if sample:                                  # softmax sampling = training behavior [CODE]
-            p = torch.softmax(logits, 0).cpu().numpy()
-            return int(self.rng.choice(len(p), p=p))
-        return int(torch.argmax(logits))            # argmax = eval behavior
-
-    def route(self, messages: list[dict], sample: bool = False,
-              agent_mask=None) -> dict:
-        h = self._hidden(messages)
-        logits = self.head @ h                      # (10,)
-        agent_logits, role_logits = logits[:N_AGENTS], logits[N_AGENTS:]
-        if agent_mask is not None:                  # adaptive k-of-n: only route to
-            torch = self.torch                      # workers offered this turn [CODE]
-            m = torch.as_tensor(agent_mask, dtype=torch.bool, device=agent_logits.device)
-            agent_logits = agent_logits.masked_fill(~m, float("-inf"))
-        agent_id = self._pick(agent_logits, sample)
-        role_id = self._pick(role_logits, sample)
-        return {
-            "agent_id": agent_id,
-            "role_id": role_id,
-            "role_name": ROLE_NAMES[role_id],
-            "agent_logits": agent_logits.detach().cpu().numpy(),
-            "role_logits": role_logits.detach().cpu().numpy(),
-        }
-
-# COORDINATOR_MARKER
 
 # ---- worker pool ------------------------------------------------------------
-# A worker is any callable: (role_name, messages, agent_id) -> reply text.
-# Real deployment binds each of the 7 agent slots to a provider; slot labels in
-# the checkpoint ("gpt-5", "gemini-2.5-pro", ...) are training metadata, freely
-# remappable — which is the product's "swap providers / dodge export controls". [CODE]
+# A worker is any callable (role_name, messages, agent_id) -> reply text; in
+# production it is openfugu.llm.WorkerPool, one litellm model per agent slot.
 WorkerFn = Callable[[str, list, int], str]
-
-DEFAULT_SLOT_LABELS = [          # [DATA] es_log.json llm_names order
-    "gpt-5", "claude-sonnet-4", "gemini-2.5-pro",
-    "deepseek-r1-distill-qwen-32b", "gemma-3-27b-it",
-    "qwen3-32b-reasoning", "qwen3-32b-direct",
-]
-
-
-class MockWorker:
-    """Offline stand-in: deterministic, lets the full loop run with no API keys.
-    The verifier accepts on the 2nd verification (so the loop demonstrably
-    terminates via ACCEPT rather than only by max-turns)."""
-    def __init__(self):
-        self._verifications = 0
-
-    def __call__(self, role_name: str, messages: list, agent_id: int) -> str:
-        slot = DEFAULT_SLOT_LABELS[agent_id] if agent_id < len(DEFAULT_SLOT_LABELS) else f"agent{agent_id}"
-        if role_name == "Thinker":
-            # thinker emits both <suggestion> and <suggested_role>, like the source
-            return ("Analysis: decompose, solve, then verify.\n"
-                    "<suggestion>break the task into steps and check the result</suggestion>\n"
-                    "<suggested_role>solver</suggested_role>")
-        if role_name == "Verifier":
-            self._verifications += 1
-            # source vocabulary is ACCEPT / REJECT
-            return "ACCEPT — solution is complete." if self._verifications >= 2 else \
-                   "REJECT — tighten the final step."
-        return f"[{slot}] concrete work toward the solution."
-
-
-class LiteLLMWorker:
-    """Real worker pool via litellm as the provider-agnostic middle layer.
-    litellm.completion() speaks one API to every backend, so each of the 7
-    agent slots can be a different provider/model with no per-vendor code —
-    which mirrors Fugu's own "swappable heterogeneous pool". [CODE]
-
-    `slot_models` is a list of up to 7 litellm model ids (e.g.
-    'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'gemini/gemini-1.5-pro').
-    Credentials/base url are taken from litellm's normal env resolution, or
-    passed through `api_key`/`api_base` (read from FUGU_API_KEY/FUGU_BASE_URL).
-    Default points every slot at FUGU_WORKER_MODEL so the loop runs with one model."""
-    def __init__(self, slot_models: list[str] | None = None,
-                 api_key: str | None = None, api_base: str | None = None,
-                 max_tokens: int = 1024, temperature: float = 0.2):
-        import litellm
-        self.litellm = litellm
-        default_model = os.environ.get("FUGU_WORKER_MODEL", "openai/gpt-4o-mini")
-        self.slot_models = slot_models or [default_model] * N_AGENTS
-        self.api_key = api_key or os.environ.get("FUGU_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.api_base = api_base or os.environ.get("FUGU_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-        self.max_tokens, self.temperature = max_tokens, temperature
-
-    def __call__(self, role_name: str, messages: list, agent_id: int) -> str:
-        model = self.slot_models[agent_id % len(self.slot_models)]
-        msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
-        kw = dict(model=model, messages=msgs,
-                  max_tokens=self.max_tokens, temperature=self.temperature)
-        if self.api_key:  kw["api_key"] = self.api_key
-        if self.api_base: kw["api_base"] = self.api_base
-        r = self.litellm.completion(**kw)
-        return r.choices[0].message.content or ""
 
 
 # ---- the coordination loop (step_trinity, faithful) -------------------------
 @dataclass
 class Turn:
+    """One executed turn: which agent ran in which role, and its reply."""
+
     turn: int
     agent_id: int
     role_name: str
@@ -277,6 +245,8 @@ class Turn:
 
 @dataclass
 class RunResult:
+    """The outcome of a coordination run."""
+
     final: str
     turns: list[Turn] = field(default_factory=list)
     terminated_by: str = ""        # "verifier_accept" | "max_turns" | "verifier_no_response"
@@ -286,10 +256,13 @@ class Coordinator:
     """Per-step TRINITY coordination loop, faithful to step_trinity (core.py).
 
     Each turn:
-      - the ROUTER conditions on [ROUTER_SYSTEM_PROMPT, {user: obs}] where `obs`
-        is the question plus the <reference_thought_N> of prior SOLVER turns —
-        a single evolving user message, not a stack of turns [F1, FC]
-      - route -> (agent_id, role_id), two independent argmax/samples [F4]
+      - the ROUTER sees [router system prompt, {user: obs + <state> line}]
+        where `obs` is the question plus the <reference_thought_N> of prior
+        SOLVER turns — a single evolving user message, not a stack of turns
+        [F1, FC]. The <state> line (turn number, role that ran last, verdict on
+        the current answer) makes the input change after thinker and verifier
+        turns too, which a deterministic API router needs.
+      - the router returns (agent_id, role)
       - role-specific worker messages mirror _format_agent/thinker/verifier [CODE]
       - SOLVER (role 0): its full reply is the answer / verifier input; its
         <think> thought is appended to `obs` as <reference_thought_N> [F2, FC]
@@ -301,32 +274,37 @@ class Coordinator:
     `suppress_cold_verifier` (deliberate deviation): a Verifier picked before any
     solver response is a no-op that would end the run at turn 0, so we re-route it
     to Worker. Set False to reproduce raw step_trinity (terminate with no response).
-    """
-    def __init__(self, router: FuguRouter, worker: WorkerFn,
-                 max_turns: int = MAX_TURNS, stop_token: str = "ACCEPT",
-                 sample: bool = True, suppress_cold_verifier: bool = True,
-                 agent_mask=None):
-        self.router, self.worker = router, worker
-        self.max_turns, self.stop_token, self.sample = max_turns, stop_token, sample
-        self.suppress_cold_verifier = suppress_cold_verifier
-        self.agent_mask = agent_mask        # adaptive k-of-n: workers offered this run [CODE]
 
-    def run(self, query: str, verbose: bool = False) -> RunResult:
-        # Per-step coordination, faithful to step_trinity. The router conditions
-        # on a SINGLE evolving user message (the question + accumulated solver
-        # thoughts), NOT a stack of turns. [F1: messages = [system, user]]
+    `agent_mask` restricts routing to the pool slots marked True; it is
+    validated here so a bad mask fails before any model is called.
+    """
+    def __init__(self, router: ApiRouter, worker: WorkerFn,
+                 max_turns: int = MAX_TURNS, stop_token: str = "ACCEPT",
+                 suppress_cold_verifier: bool = True,
+                 agent_mask: Sequence[bool] | None = None):
+        self.router, self.worker = router, worker
+        self.max_turns, self.stop_token = max_turns, stop_token
+        self.suppress_cold_verifier = suppress_cold_verifier
+        self.agent_mask = agent_mask
+        self.allowed = allowed_agents(len(router.pool), agent_mask)
+
+    def run(self, query: str) -> RunResult:
+        """Coordinate the pool on `query` until a verifier accepts or turns run out."""
+        # The router conditions on a SINGLE evolving user message (the question +
+        # accumulated solver thoughts), NOT a stack of turns. [F1: messages = [system, user]]
         obs = query                            # the evolving router observation (messages[1].content)
         ref_id = 0                             # <reference_thought_N> counter [core.py:495]
         res = RunResult(final="")
         last_response: str | None = None       # self.response — full latest solver output
         suggestion: str | None = None          # thinker's <suggestion> for next worker
         suggested_role: str | None = None      # thinker's <suggested_role> override
+        last_role: str | None = None           # router vocabulary; role that ran last turn
+        last_verdict: str | None = None        # verifier verdict on last_response, if reviewed
 
         for t in range(self.max_turns):
-            # router sees [system_router, {user: obs}] — obs carries prior solver thoughts
-            route_msgs = [{"role": "system", "content": ROUTER_SYSTEM_PROMPT.format(num_agents=N_AGENTS)},
-                          {"role": "user", "content": obs}]
-            r = self.router.route(route_msgs, sample=self.sample, agent_mask=self.agent_mask)
+            route_msgs = router_messages(self.router.pool, self.allowed, obs,
+                                         router_state(t, last_role, last_verdict))
+            r = self.router.route(route_msgs, agent_mask=self.agent_mask)
             role = r["role_name"]
             if suggested_role:                      # thinker override consumes here [CODE]
                 role, suggested_role = suggested_role, None
@@ -343,11 +321,12 @@ class Coordinator:
             msgs = self._format_messages(role, query, last_response, suggestion)
             reply = self.worker(role, msgs, agent_id)
             res.turns.append(Turn(t, agent_id, role, reply))
-            if verbose:
-                print(f"  turn {t}: agent={agent_id} role={role}  {reply[:80]}")
+            logger.info("turn %d: agent=%d role=%s reply_chars=%d", t, agent_id, role, len(reply))
+            last_role = ROUTER_ROLES[role]
 
             if role == "Worker":                    # solver (role_id 0)
                 last_response = reply               # full output = answer / verifier input [F2]
+                last_verdict = None                 # a new answer has not been reviewed yet
                 suggestion = None
                 # only the SOLVER updates the router obs, via <reference_thought_N> [FC]
                 thought = self._extract_thought(reply)
@@ -362,6 +341,7 @@ class Coordinator:
                     res.final = last_response or reply
                     res.terminated_by = "verifier_accept"
                     return res
+                last_verdict = "REJECT"
 
         res.final = last_response or (res.turns[-1].reply if res.turns else "")
         if not res.terminated_by:
@@ -372,7 +352,6 @@ class Coordinator:
     def _extract_thought(reply: str) -> str:
         """Mirror _get_obs: take the <think>...</think> content; if absent, the
         whole reply (minus stray think tags). [core.py:478-485]"""
-        import re
         m = re.search(r"<think>([\s\S]*?)</think>", reply, re.I)
         if m:
             return m.group(1).strip()
@@ -404,11 +383,10 @@ class Coordinator:
     def _parse_thinker(text: str):
         """Mirror _parse_thinker_response: extract <suggested_role> + <suggestion>. [CODE]
         Returns (role_name_or_None, suggestion_or_None)."""
-        import re
         role = None
         m = re.search(r"<suggested_role>\s*(solver|thinker|verifier)\s*</suggested_role>", text, re.I)
         if m:
-            role = {"solver": "Worker", "thinker": "Thinker", "verifier": "Verifier"}[m.group(1).lower()]
+            role = ROLE_NAMES[m.group(1).lower()]
         sug = None
         s = re.search(r"<suggestion>\s*([\s\S]*?)\s*</suggestion>", text, re.I)
         if s:
@@ -418,90 +396,3 @@ class Coordinator:
     def _parse_verification(self, text: str) -> bool:
         """Mirror _parse_verification_response: ACCEPT (vs REJECT) at the start. [CODE]"""
         return text.strip().upper().startswith(self.stop_token)
-
-# CLI_MARKER
-
-# ---- self-test: prove the implementation is faithful to the checkpoint ------
-def self_test(router: FuguRouter, fixture_path: str) -> int:
-    """Re-run the 37-case routing fixture. This is the regression guard: if the
-    implementation drifts from model_iter_60.npy, accuracy collapses. Expect
-    ~95% agent / 100% role (vs ~51% best-constant baseline). [EXEC]"""
-    cases = json.load(open(fixture_path))["cases"]
-    a_hit = r_hit = 0
-    from collections import Counter
-    ea = [c["expected"]["agent_id"] for c in cases]
-    er = [c["expected"]["role_id"] for c in cases]
-    base_a = Counter(ea).most_common(1)[0][1] / len(cases)
-    base_r = Counter(er).most_common(1)[0][1] / len(cases)
-    for c in cases:
-        r = router.route(c["messages"], sample=False)   # argmax for eval
-        a_hit += (r["agent_id"] == c["expected"]["agent_id"])
-        r_hit += (r["role_id"] == c["expected"]["role_id"])
-    n = len(cases)
-    print(f"self-test on {n} cases:")
-    print(f"  agent {a_hit}/{n} = {a_hit/n:.0%}   (baseline {base_a:.0%})")
-    print(f"  role  {r_hit}/{n} = {r_hit/n:.0%}   (baseline {base_r:.0%})")
-    ok = a_hit / n >= 0.90 and r_hit / n >= 0.95
-    print("  PASS — implementation faithful to checkpoint" if ok else
-          "  FAIL — implementation drifted from checkpoint")
-    return 0 if ok else 1
-
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Minimal faithful Fugu (TRINITY) inference.")
-    ap.add_argument("--model", help="Qwen3-0.6B dir (env FUGU_MODEL)")
-    ap.add_argument("--vector", help="model_iter_60.npy (env FUGU_VECTOR)")
-    ap.add_argument("--fixture", help="qwen_router_prompt_eval_cases.json (env FUGU_FIXTURE)")
-    ap.add_argument("--self-test", action="store_true")
-    ap.add_argument("--demo", action="store_true")
-    ap.add_argument("--route", metavar="PROMPT", help="one routing decision for PROMPT")
-    ap.add_argument("--live", action="store_true",
-                    help="demo with a real worker pool via litellm (needs FUGU_API_KEY/_BASE_URL)")
-    ap.add_argument("--slot-models", metavar="CSV",
-                    help="comma-separated litellm model ids for the 7 agent slots")
-    ap.add_argument("--query", help="override the --demo query")
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args(argv)
-
-    model = _resolve(args.model, "FUGU_MODEL", "Qwen/Qwen3-0.6B")
-    vector = _resolve(args.vector, "FUGU_VECTOR", "model_iter_60.npy")
-    fixture = _resolve(args.fixture, "FUGU_FIXTURE",
-                       "trinity_coordinator/examples/fixtures/qwen_router_prompt_eval_cases.json")
-
-    if not (args.self_test or args.demo or args.route):
-        ap.error("choose one of --self-test / --demo / --route")
-
-    router = FuguRouter(model, vector, seed=args.seed)
-
-    if args.self_test:
-        return self_test(router, fixture)
-
-    if args.route:
-        r = router.route([{"role": "user", "content": args.route}], sample=False)
-        slot = DEFAULT_SLOT_LABELS[r["agent_id"]]
-        print(f"agent {r['agent_id']} ({slot}), role {r['role_name']}")
-        print(f"  agent_logits {np.round(r['agent_logits'], 2)}")
-        print(f"  role_logits  {np.round(r['role_logits'], 2)}")
-        return 0
-
-    if args.demo:
-        if args.live:
-            models = args.slot_models.split(",") if args.slot_models else None
-            worker = LiteLLMWorker(slot_models=models)
-            print("worker pool: LiteLLMWorker (live, via litellm)")
-        else:
-            worker = MockWorker()
-            print("worker pool: MockWorker (offline)")
-        coord = Coordinator(router, worker, sample=True)
-        q = args.query or "Implement binary search in Python and prove it terminates."
-        print(f"query: {q}\n")
-        res = coord.run(q, verbose=True)
-        print(f"\nterminated_by: {res.terminated_by}  ({len(res.turns)} turns)")
-        print(f"final: {res.final[:400]}")
-        return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-
-
