@@ -1,3 +1,5 @@
+> **Historical background — not the current runtime; see tag [`pre-api-only`](https://github.com/onezox/OpenFugu/tree/pre-api-only).**
+
 # How Fugu Is Implemented — A Technical Disclosure
 
 *A reverse-engineering disclosure of Sakana AI's Fugu orchestrator family,
