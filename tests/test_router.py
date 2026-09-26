@@ -23,7 +23,9 @@ def turn0_messages(allowed=ALL):
     '<think>perhaps {"agent_id": 0, "role": "thinker"}</think>{"agent_id": 1, "role": "solver"}',
     'First idea {"agent_id": 0, "role": "thinker"}, final: {"agent_id": 1, "role": "solver"}',
     '{"agent_id": 1, "role": " Solver ", "reason": "fast"}',
-], ids=["plain", "fenced", "prose", "think-block", "last-wins", "case-and-extra-keys"])
+    'Pick {agent 1} to solve: {"agent_id": 1, "role": "solver"}',
+], ids=["plain", "fenced", "prose", "think-block", "last-wins", "case-and-extra-keys",
+        "brace-in-prose"])
 def test_parse_route_accepts(reply):
     assert parse_route(reply, ALL) == (1, "solver")
 

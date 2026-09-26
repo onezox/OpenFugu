@@ -123,6 +123,11 @@ def test_curly_quotes_inside_straight_quotes_are_kept():
     assert workflow.subtasks == ["Print “hello”"]
 
 
+def test_escaped_quotes_and_brackets_inside_strings_stay_in_the_string():
+    workflow = parse_and_validate(workflow_text(subtasks=r'["Print \"]\" then [stop]"]'))
+    assert workflow.subtasks == ['Print "]" then [stop]']
+
+
 def test_json_literals_are_accepted():
     _, _, access = parse_workflow(workflow_text("[0, 1]", '["a", "b"]', "[[], null]"))
     assert access == [[], None]
@@ -205,6 +210,15 @@ def test_duplicate_access_indices_are_merged():
     workflow = parse_and_validate(workflow_text("[0, 1, 2]", '["a", "b", "c"]',
                                                 "[[], [0, 0], [1, 0, 1]]"))
     assert workflow.sees == [[], [0], [0, 1]]
+
+
+def test_long_values_are_shortened_in_the_error_message():
+    long_name = "openai/" + "x" * 100
+    with pytest.raises(WorkflowError) as info:
+        parse_and_validate(workflow_text(model_id=f'["{long_name}"]'))
+    assert str(info.value) == (f"model_id[0] = {repr(long_name)[:77]}...: "
+                               f"must be an integer worker index")
+    assert info.value.value == long_name
 
 
 def test_workflow_error_names_the_list_index_value_and_rule():

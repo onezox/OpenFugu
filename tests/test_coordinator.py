@@ -4,7 +4,8 @@ import json
 import pytest
 
 from openfugu.llm import Endpoint
-from openfugu.mini import ApiRouter, Coordinator
+from openfugu.mini import (SYSTEM_PROMPT, THINKER_PROMPT, VERIFICATION_PROMPT, ApiRouter,
+                           Coordinator)
 
 POOL = ["openai/alpha", "openai/beta"]
 ENDPOINT = Endpoint("openai/router", api_key="test-key")
@@ -95,6 +96,81 @@ def test_cold_verifier_runs_as_solver_and_state_reports_solver(fake_llm):
     assert router_inputs(fake)[1].endswith(
         "<state>turn=1 last_role=solver last_verdict=none</state>")
     assert result.terminated_by == "verifier_accept"
+
+
+def test_cold_verifier_ends_the_run_when_suppression_is_off(fake_llm):
+    script_router(fake_llm, [(0, "verifier")])
+    worker = ScriptedWorker()
+    result = Coordinator(ApiRouter(ENDPOINT, POOL), worker,
+                         suppress_cold_verifier=False).run("Q")
+    assert (result.terminated_by, result.final, result.turns) == ("verifier_no_response", "", [])
+    assert worker.calls == []
+
+
+def test_thinker_suggested_role_overrides_the_router_once(fake_llm):
+    fake = script_router(fake_llm, [(0, "thinker"), (1, "verifier"), (1, "verifier")])
+    calls = []
+
+    def worker(role_name, messages, agent_id):
+        calls.append((role_name, agent_id))
+        if role_name == "Thinker":
+            return "<suggestion>show each step</suggestion><suggested_role>solver</suggested_role>"
+        return "ACCEPT" if role_name == "Verifier" else SOLVER_REPLY
+    result = Coordinator(ApiRouter(ENDPOINT, POOL), worker).run("Q")
+    # turn 1: the router's agent in the thinker's role; turn 2: the router's own choice again
+    assert calls == [("Thinker", 0), ("Worker", 1), ("Verifier", 1)]
+    assert router_inputs(fake)[2].endswith("last_role=solver last_verdict=none</state>")
+    assert result.terminated_by == "verifier_accept"
+
+
+def test_running_out_of_turns_returns_the_last_answer_not_the_verdict(fake_llm):
+    script_router(fake_llm, [(0, "solver"), (1, "verifier")])
+    result = Coordinator(ApiRouter(ENDPOINT, POOL), ScriptedWorker(["REJECT - wrong"]),
+                         max_turns=2).run("Q")
+    assert (result.terminated_by, result.final) == ("max_turns", SOLVER_REPLY)
+    assert [turn.role_name for turn in result.turns] == ["Worker", "Verifier"]
+
+
+@pytest.mark.parametrize("reply, observation", [
+    ("<think>2+2 is 4</think>The answer is 4.",
+     "Q\n<reference_thought_0>2+2 is 4</reference_thought_0>"),
+    ("The answer is 4.", "Q\n<reference_thought_0>The answer is 4.</reference_thought_0>"),
+    ("<think> </think>The answer is 4.", "Q"),
+    ("", "Q"),
+], ids=["think-block", "no-think-block", "empty-think-block", "empty-reply"])
+def test_solver_thought_that_reaches_the_router(fake_llm, reply, observation):
+    fake = script_router(fake_llm, [(0, "solver"), (0, "solver")])
+    Coordinator(ApiRouter(ENDPOINT, POOL), lambda role, messages, agent_id: reply,
+                max_turns=2).run("Q")
+    assert router_inputs(fake)[1] == (
+        f"{observation}\n<state>turn=1 last_role=solver last_verdict=none</state>")
+
+
+def test_worker_messages_for_each_role(fake_llm):
+    """Thinker without and with a current answer, solver and verifier with a suggestion."""
+    script_router(fake_llm, [(0, "thinker"), (1, "solver"), (0, "thinker"), (1, "verifier")])
+    replies = iter(["<suggestion>add units</suggestion>", "4 apples",
+                    "<suggestion>check the sum</suggestion>", "ACCEPT"])
+    received = []
+
+    def worker(role_name, messages, agent_id):
+        received.append(messages)
+        return next(replies)
+    Coordinator(ApiRouter(ENDPOINT, POOL), worker).run("2+2 apples?")
+
+    system = {"role": "system", "content": SYSTEM_PROMPT}
+    assert received == [
+        [system, {"role": "user", "content": THINKER_PROMPT.format(info="2+2 apples?")}],
+        [system, {"role": "user", "content": (
+            "2+2 apples?when drafting your response, thinking of following:\n"
+            "<suggestion>add units</suggestion>")}],
+        [system, {"role": "user", "content": THINKER_PROMPT.format(
+            info="2+2 apples?\n\nCurrent response:\n4 apples")}],
+        [system, {"role": "user", "content": (
+            VERIFICATION_PROMPT.format(query="2+2 apples?", response="4 apples")
+            + "These are useful suggestions when drafting your response:\n"
+              "<suggestion>check the sum</suggestion>")}],
+    ]
 
 
 @pytest.mark.parametrize("mask, message", [

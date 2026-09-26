@@ -142,6 +142,14 @@ def test_empty_messages_is_still_a_400(fake_llm, fugu_server):
     assert fake.calls == []
 
 
+def test_post_to_another_path_is_a_404(fake_llm, fugu_server):
+    fake = fake_llm([])
+    body = json.dumps({"messages": [{"role": "user", "content": "Q"}]}).encode()
+    assert request(fugu_server(), "POST", "/v1/completions", body) == (
+        404, b'{"error": "not found"}')
+    assert fake.calls == []
+
+
 def test_get_endpoints_are_unchanged(fugu_server):
     address = fugu_server()
     assert request(address, "GET", "/health") == (200, b'{"status": "ok", "model": "fugu"}')
@@ -170,6 +178,14 @@ def test_main_rejects_empty_slot_entries(monkeypatch, caplog):
     monkeypatch.setenv("FUGU_API_KEY", "test-key")
     assert main(["--slot-models", "openai/w0,,openai/w1"]) == 1
     assert "configuration error: --slot-models" in caplog.text
+
+
+def test_main_reports_an_address_it_cannot_listen_on(monkeypatch, caplog):
+    monkeypatch.setenv("FUGU_CONDUCTOR_MODEL", ROUTER_MODEL)
+    monkeypatch.setenv("FUGU_API_KEY", "test-key")
+    # 192.0.2.1 is TEST-NET-1 (RFC 5737): a valid address that no local interface has
+    assert main(["--slot-models", "openai/w0", "--host", "192.0.2.1", "--port", "8123"]) == 1
+    assert "cannot listen on 192.0.2.1:8123" in caplog.text
 
 
 @pytest.mark.parametrize("argv", [

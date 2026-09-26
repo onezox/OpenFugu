@@ -125,6 +125,20 @@ def test_complete_does_not_retry_permanent_errors_and_redacts_the_key(fake_llm):
     assert info.value.__cause__ is None and info.value.__suppress_context__
 
 
+def test_complete_reports_failures_of_an_endpoint_without_a_key(fake_llm):
+    fake_llm([auth_error()])
+    with pytest.raises(LLMCallError, match="^openai/test-model: AuthenticationError"):
+        complete(Endpoint("openai/test-model"), MESSAGES, max_tokens=5, temperature=0.0,
+                 timeout=5, attempts=1)
+
+
+def test_complete_needs_at_least_one_attempt(fake_llm):
+    fake = fake_llm([])
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        complete(ENDPOINT, MESSAGES, max_tokens=5, temperature=0.0, timeout=5, attempts=0)
+    assert fake.calls == []
+
+
 # ---- worker pool ---------------------------------------------------------------
 TWO_SLOTS = ["openai/w0", "openai/w1"]
 
