@@ -209,15 +209,80 @@ def test_invalid_json_body_is_a_400(fake_llm, fugu_server):
     assert fake.calls == []
 
 
-def test_negative_content_length_is_a_400(fugu_server):
-    with socket.create_connection(fugu_server(), timeout=10) as sock:
-        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\n"
-                     b"Content-Length: -1\r\nConnection: close\r\n\r\n")
+def raw_exchange(address, *parts, pause=0.0):
+    """Send each part in turn on one connection, waiting `pause` seconds after each;
+    return everything the server sends until it closes."""
+    with socket.create_connection(address, timeout=10) as sock:
+        for part in parts:
+            sock.sendall(part)
+            threading.Event().wait(pause)       # conftest turns time.sleep into a no-op
         response = b""
         while chunk := sock.recv(65536):
             response += chunk
+    return response
+
+
+def test_negative_content_length_is_a_400(fugu_server):
+    response = raw_exchange(fugu_server(), b"POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\n"
+                                           b"Content-Length: -1\r\nConnection: close\r\n\r\n")
     assert response.startswith(b"HTTP/1.1 400 ")
     assert response.endswith(b'{"error": "invalid JSON body"}')
+
+
+# A complete request hidden in the body of another; it must never be answered.
+HIDDEN_REQUEST = b"GET /v1/models HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+
+
+@pytest.mark.parametrize("request_head, status", [
+    (b"POST /nope HTTP/1.1\r\nContent-Length: {n}", 404),
+    (b"GET /health HTTP/1.1\r\nContent-Length: {n}", 200),
+    (b"POST /v1/chat/completions HTTP/1.1\r\nTransfer-Encoding: chunked", 411),
+    (b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: {n}", 400),
+    (b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: many", 400),
+], ids=["post-unknown-path", "get-with-body", "chunked", "two-content-lengths",
+        "bad-content-length"])
+def test_an_unread_body_is_never_parsed_as_another_request(fake_llm, fugu_server,
+                                                           request_head, status):
+    fake = fake_llm([])
+    head = request_head.replace(b"{n}", str(len(HIDDEN_REQUEST)).encode())
+    response = raw_exchange(fugu_server(), head + b"\r\nHost: test\r\n\r\n" + HIDDEN_REQUEST)
+    # one response, which closes the connection; the hidden request is never answered
+    assert re.findall(rb"HTTP/1\.1 (\d{3}) ", response) == [str(status).encode()]
+    assert b"\r\nConnection: close\r\n" in response
+    assert b'"object": "list"' not in response
+    assert fake.calls == []
+
+
+def test_a_body_arriving_after_the_response_does_not_reset_it(fake_llm, fugu_server):
+    """The server answers before reading the body. Closing while the body is still
+    arriving would reset the connection and destroy the response unread."""
+    fake_llm([])
+    head = b"POST /nope HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n" % len(HIDDEN_REQUEST)
+    response = raw_exchange(fugu_server(), head, HIDDEN_REQUEST, pause=0.2)
+    assert re.findall(rb"HTTP/1\.1 (\d{3}) ", response) == [b"404"]
+    assert response.endswith(b'{"error": "not found"}')
+
+
+def test_a_fully_read_request_keeps_the_connection_open(fake_llm, fugu_server):
+    fake_llm(solve_then_accept)
+    connection = http.client.HTTPConnection(*fugu_server(), timeout=10)
+    try:
+        sock = None
+        for method, path, body, status in [
+            ("POST", "/v1/chat/completions", b'{"messages": [', 400),
+            ("POST", "/v1/chat/completions",
+             json.dumps({"messages": [{"role": "user", "content": "Q"}]}).encode(), 200),
+            ("POST", "/nope", None, 404),
+            ("GET", "/health", None, 200),
+        ]:
+            connection.request(method, path, body=body)
+            response = connection.getresponse()
+            response.read()
+            assert (response.status, response.getheader("Connection")) == (status, None)
+            sock = sock or connection.sock
+            assert connection.sock is sock                  # the same connection throughout
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize("payload, error", [

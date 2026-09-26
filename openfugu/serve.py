@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import socket
 import sys
 import time
 import uuid
@@ -40,6 +41,7 @@ logger = logging.getLogger("openfugu.serve")
 
 MODEL_NAME = "fugu"
 DEFAULT_HOST = "127.0.0.1"
+LINGER_S = 5.0          # longest wait for a client to finish sending before a close
 
 
 class BadRequest(ValueError):
@@ -97,6 +99,26 @@ class FuguServer(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.router, self.workers, self.max_turns = router, workers, max_turns
 
+    def shutdown_request(self, request: socket.socket) -> None:
+        """Close a connection without losing the last response.
+
+        Closing a socket that still holds unread input, such as a request body
+        the handler did not read, makes TCP reset the connection, and the reset
+        can destroy the response before the client reads it. So the server
+        sends its FIN first, then reads and discards whatever the client still
+        sends until the client closes or LINGER_S passes, and only then closes.
+        """
+        deadline = time.monotonic() + LINGER_S
+        try:
+            request.shutdown(socket.SHUT_WR)
+            while (remaining := deadline - time.monotonic()) > 0:
+                request.settimeout(remaining)
+                if not request.recv(65536):
+                    break
+        except OSError:                                 # timed out, reset or already closed
+            pass
+        self.close_request(request)
+
 
 class Handler(BaseHTTPRequestHandler):
     """Serves /v1/chat/completions, /v1/models and /health."""
@@ -104,30 +126,51 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server: FuguServer
 
-    def _send(self, code: int, body: dict):
+    def _send(self, code: int, body: dict, *, close: bool = False):
+        """Send a JSON response. `close` ends the connection after it; a response
+        must close when the request body was not read in full, or the unread
+        bytes would be parsed as the next request on this keep-alive connection."""
         data = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        if close:
+            self.send_header("Connection", "close")      # also sets self.close_connection
         self.end_headers()
         self.wfile.write(data)
 
+    def _has_body(self) -> bool:
+        """Whether the request declares a body: chunked, or a Content-Length other than 0."""
+        return ("Transfer-Encoding" in self.headers
+                or self.headers.get("Content-Length", "0").strip() != "0")
+
     def do_GET(self):
+        close = self._has_body()                        # a GET body is never read
         if self.path == "/v1/models":
             self._send(200, {"object": "list", "data": [
-                {"id": MODEL_NAME, "object": "model", "owned_by": "openfugu"}]})
+                {"id": MODEL_NAME, "object": "model", "owned_by": "openfugu"}]}, close=close)
         elif self.path in ("/health", "/"):
-            self._send(200, {"status": "ok", "model": MODEL_NAME})
+            self._send(200, {"status": "ok", "model": MODEL_NAME}, close=close)
         else:
-            self._send(404, {"error": "not found"})
+            self._send(404, {"error": "not found"}, close=close)
 
     def do_POST(self):
         if self.path.rstrip("/") != "/v1/chat/completions":
-            self._send(404, {"error": "not found"}); return
+            self._send(404, {"error": "not found"}, close=self._has_body()); return
+        if "Transfer-Encoding" in self.headers:         # http.server cannot decode chunked bodies
+            self._send(411, {"error": "Content-Length required; Transfer-Encoding is not "
+                                      "supported"}, close=True); return
         try:
-            n = int(self.headers.get("Content-Length", 0))
+            # Several Content-Length headers make the body length ambiguous.
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) > 1:
+                raise ValueError("several Content-Length headers")
+            n = int(lengths[0]) if lengths else 0
             if n < 0:
                 raise ValueError("negative Content-Length")
+        except ValueError:
+            self._send(400, {"error": "invalid JSON body"}, close=True); return
+        try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
             self._send(400, {"error": "invalid JSON body"}); return

@@ -137,3 +137,44 @@ to the server log, with API keys removed.
 - **THEN** the server SHALL respond 500 with `internal server error` and log
   the error without the API key
 
+### Requirement: Never parse an unread body as another request
+
+When the server responds without having read the whole request body, it SHALL
+send `Connection: close` and close the connection, so that on a keep-alive
+connection the unread bytes are never parsed as a further request. It SHALL
+reject a request body sent with `Transfer-Encoding` with 411 and a request
+with an invalid or repeated `Content-Length` with 400, closing the connection
+in both cases. Before closing any connection, it SHALL read and discard what
+the client still sends, until the client closes or 5 seconds pass, so that
+unread input never makes TCP reset the connection and destroy the response. A
+request whose body was read in full SHALL keep the connection open.
+
+#### Scenario: A request hidden in the body of a request to an unknown path
+
+- **WHEN** a POST to an unknown path, or a GET, carries a body that is itself
+  a complete HTTP request
+- **THEN** the server SHALL send exactly one response, with
+  `Connection: close`, and SHALL never answer the hidden request
+
+#### Scenario: Chunked request body
+
+- **WHEN** a POST to `/v1/chat/completions` uses `Transfer-Encoding: chunked`
+- **THEN** the server SHALL respond 411, close the connection and call no
+  model
+
+#### Scenario: The body arrives after the response
+
+- **WHEN** the server has answered a request without reading its body, and
+  the body arrives afterwards
+- **THEN** the client SHALL still receive the complete response
+
+#### Scenario: Repeated Content-Length
+
+- **WHEN** a request has more than one `Content-Length` header
+- **THEN** the server SHALL respond 400 and close the connection
+
+#### Scenario: Fully read requests on one connection
+
+- **WHEN** a client sends several requests on one connection, each with its
+  body in full
+- **THEN** the server SHALL answer each of them on that connection

@@ -161,14 +161,21 @@ curl -s http://127.0.0.1:8088/v1/chat/completions \
 `usage.fugu_turns` is the number of turns the request ran. Errors return
 `{"error": "<message>"}`:
 
-- **400** for a malformed request: invalid JSON, a body that is not a JSON
-  object, a missing or empty `messages` list, a message that is not an object,
-  or a last user message whose content is neither a string nor a list of
-  content parts.
+- **400** for a malformed request: an invalid or repeated `Content-Length`
+  header, invalid JSON, a body that is not a JSON object, a missing or empty
+  `messages` list, a message that is not an object, or a last user message
+  whose content is neither a string nor a list of content parts.
 - **404** for any other path.
+- **411** for a body sent with `Transfer-Encoding` (such as chunked); send it
+  with `Content-Length` instead.
 - **500** `internal server error` when a worker call still fails after its
   retries, or on an unexpected error. The details go only to the server log,
   with API keys removed.
+
+When the server answers without reading the whole request body, it closes the
+connection, so unread bytes are never taken as another request. Before any
+close, it discards what the client still sends for up to 5 seconds, so the
+response is not lost to a connection reset.
 
 A failing router never fails a request: when it gives no valid decision in 3
 attempts, or its API fails with a permanent error, the turn falls back to the
