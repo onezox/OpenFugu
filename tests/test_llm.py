@@ -1,9 +1,10 @@
-"""openfugu.llm: endpoint configuration, startup checks and the retrying call path."""
+"""openfugu.llm: endpoint configuration, startup checks, the retrying call path
+and the shared worker pool."""
 import pytest
 
 from fakes import auth_error, rate_limit_error
-from openfugu.llm import (ConfigError, Endpoint, LLMCallError, check_endpoint, complete,
-                          conductor_endpoint, router_endpoint)
+from openfugu.llm import (ConfigError, Endpoint, LLMCallError, WorkerPool, check_endpoint,
+                          complete, conductor_endpoint, parse_slot_models, router_endpoint)
 
 MESSAGES = [{"role": "user", "content": "hi"}]
 ENDPOINT = Endpoint("openai/test-model", api_key="test-key")
@@ -94,6 +95,7 @@ def test_complete_returns_text_and_passes_call_settings(fake_llm):
     assert (call["model"], call["api_key"], call["api_base"]) == (
         "openai/test-model", "test-key", "http://host.test/v1")
     assert (call["max_tokens"], call["temperature"], call["timeout"]) == (5, 0.0, 7.0)
+    assert call["max_retries"] == 0      # the OpenAI SDK must not retry behind our back
 
 
 def test_complete_retries_transient_errors(fake_llm):
@@ -119,3 +121,81 @@ def test_complete_does_not_retry_permanent_errors_and_redacts_the_key(fake_llm):
     assert len(fake.calls) == 1
     assert "AuthenticationError" in str(info.value)
     assert "test-key" not in str(info.value)
+    # the unredacted provider exception must not ride along into logged tracebacks
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+
+
+# ---- worker pool ---------------------------------------------------------------
+TWO_SLOTS = ["openai/w0", "openai/w1"]
+
+
+def test_worker_pool_uses_fugu_worker_settings(fake_llm, monkeypatch):
+    set_env(monkeypatch, FUGU_API_KEY="worker-key", FUGU_BASE_URL="http://workers.test/v1",
+            FUGU_WORKER_MODEL="openai/ignored")
+    fake = fake_llm(["hi"])
+    assert WorkerPool.from_env(TWO_SLOTS)("Worker", MESSAGES, 1) == "hi"
+    call = fake.calls[0]
+    assert (call["model"], call["api_key"], call["api_base"]) == (
+        "openai/w1", "worker-key", "http://workers.test/v1")
+    assert (call["temperature"], call["timeout"], call["max_tokens"]) == (0.2, 120.0, 1024)
+
+
+def test_worker_pool_does_not_read_openai_variables_itself(fake_llm, monkeypatch):
+    set_env(monkeypatch, OPENAI_API_KEY="sk-openai", OPENAI_BASE_URL="http://openai.test/v1")
+    fake = fake_llm(["hi"])
+    WorkerPool.from_env(TWO_SLOTS)("Worker", MESSAGES, 0)
+    assert "api_key" not in fake.calls[0]
+    assert "api_base" not in fake.calls[0]
+
+
+@pytest.mark.parametrize("agent_id", [-1, 2, 7])
+def test_worker_pool_rejects_out_of_range_ids_without_wrapping(fake_llm, agent_id):
+    fake = fake_llm([])
+    with pytest.raises(ValueError, match=f"agent_id {agent_id} is outside the pool of 2 workers"):
+        WorkerPool(TWO_SLOTS, "test-key")("Worker", MESSAGES, agent_id)
+    assert fake.calls == []
+
+
+def test_worker_failure_raises_llm_call_error_after_retrying_transient_errors(fake_llm):
+    fake = fake_llm([rate_limit_error(), auth_error()])
+    with pytest.raises(LLMCallError) as info:
+        WorkerPool(TWO_SLOTS, "test-key")("Worker", MESSAGES, 0)
+    assert not info.value.retryable
+    assert len(fake.calls) == 2
+
+
+def test_worker_pool_check_names_the_slot_without_a_key(monkeypatch):
+    set_env(monkeypatch, OPENAI_API_KEY="sk-openai")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    pool = WorkerPool(["openai/w0", "anthropic/claude-test"])
+    with pytest.raises(ConfigError, match="worker 1 model 'anthropic/claude-test'.*ANTHROPIC_API_KEY"):
+        pool.check()
+
+
+def test_worker_pool_check_accepts_a_fugu_key_for_every_slot(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    WorkerPool(["openai/w0", "anthropic/claude-test"], "test-key").check()
+
+
+def test_worker_pool_check_rejects_a_model_without_provider():
+    with pytest.raises(ConfigError, match="worker 0 model 'my-finetune'"):
+        WorkerPool(["my-finetune"], "test-key").check()
+
+
+def test_empty_worker_pool_is_rejected():
+    with pytest.raises(ValueError, match="empty"):
+        WorkerPool([])
+
+
+@pytest.mark.parametrize("csv, models", [
+    ("openai/w0", ["openai/w0"]),
+    (" openai/w0 , anthropic/claude-test ", ["openai/w0", "anthropic/claude-test"]),
+])
+def test_parse_slot_models(csv, models):
+    assert parse_slot_models(csv) == models
+
+
+@pytest.mark.parametrize("csv", ["", " ", "openai/w0,", "openai/w0,,openai/w1"])
+def test_parse_slot_models_rejects_empty_entries(csv):
+    with pytest.raises(ConfigError, match="no empty entries"):
+        parse_slot_models(csv)

@@ -26,18 +26,16 @@ import argparse
 import ast
 import json
 import logging
-import os
 import re
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from openfugu.llm import (ConfigError, Endpoint, LLMCallError, check_endpoint, complete,
-                          conductor_endpoint)
+from openfugu.llm import (ConfigError, Endpoint, LLMCallError, WorkerPool, check_endpoint,
+                          complete, conductor_endpoint, configure_logging, parse_slot_models)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("openfugu.ultra")
 
-N_AGENTS = 7
 MAX_STEPS = 5                      # [DOC] Conductor workflows up to 5 steps
 CONDUCTOR_ATTEMPTS = 3
 CONDUCTOR_TIMEOUT_S = 120.0
@@ -308,29 +306,6 @@ class ConductorExecutor:
         return res
 
 
-class LiteLLMWorker:
-    """Provider-agnostic worker via litellm (same middle layer as fugu_mini)."""
-    def __init__(self, slot_models=None, api_key=None, api_base=None,
-                 max_tokens=1024, temperature=0.2):
-        import litellm
-        self.litellm = litellm
-        default = os.environ.get("FUGU_WORKER_MODEL", "openai/gpt-4o-mini")
-        self.slot_models = slot_models or [default] * N_AGENTS
-        self.api_key = api_key or os.environ.get("FUGU_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.api_base = api_base or os.environ.get("FUGU_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-        self.max_tokens, self.temperature = max_tokens, temperature
-
-    def _call(self, model, messages):
-        kw = dict(model=model, messages=messages,
-                  max_tokens=self.max_tokens, temperature=self.temperature)
-        if self.api_key:  kw["api_key"] = self.api_key
-        if self.api_base: kw["api_base"] = self.api_base
-        return self.litellm.completion(**kw).choices[0].message.content or ""
-
-    def __call__(self, subtask, messages, agent_id):
-        return self._call(self.slot_models[agent_id % len(self.slot_models)], messages)
-
-
 # ---- CLI -----------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     """Run one query: the Conductor designs a workflow, the pool executes it."""
@@ -340,9 +315,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--slot-models", metavar="CSV", required=True,
                     help="comma-separated litellm worker model ids; worker i is entry i")
     args = ap.parse_args(argv)
-    pool = args.slot_models.split(",")
+    configure_logging(logging.WARNING)
 
     try:
+        pool = parse_slot_models(args.slot_models)
+        workers = WorkerPool.from_env(pool)
+        workers.check()
         endpoint = conductor_endpoint()
         check_endpoint(endpoint, "Conductor")
     except ConfigError as exc:
@@ -366,7 +344,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"workflow: model_id={workflow.model_ids}  access_list={workflow.access_list}"
           f"  ({len(workflow.subtasks)} steps)\n")
-    res = ConductorExecutor(LiteLLMWorker(slot_models=pool)).execute(workflow)
+    try:
+        res = ConductorExecutor(workers).execute(workflow)
+    except LLMCallError as exc:
+        print(f"worker call failed: {exc}", file=sys.stderr)
+        return 1
     for step in res.steps:
         print(f"  step {step.idx}: agent={step.agent_id} ({pool[step.agent_id]}) "
               f"sees={step.sees}")

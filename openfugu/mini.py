@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -229,39 +228,9 @@ class ApiRouter:
 
 
 # ---- worker pool ------------------------------------------------------------
-# A worker is any callable: (role_name, messages, agent_id) -> reply text.
+# A worker is any callable (role_name, messages, agent_id) -> reply text; in
+# production it is openfugu.llm.WorkerPool, one litellm model per agent slot.
 WorkerFn = Callable[[str, list, int], str]
-
-
-class LiteLLMWorker:
-    """Real worker pool via litellm as the provider-agnostic middle layer.
-    litellm.completion() speaks one API to every backend, so each agent slot
-    can be a different provider/model with no per-vendor code — which mirrors
-    Fugu's own "swappable heterogeneous pool". [CODE]
-
-    `slot_models` is the list of litellm model ids, one per agent slot (e.g.
-    'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'gemini/gemini-1.5-pro').
-    Credentials/base url are taken from litellm's normal env resolution, or
-    passed through `api_key`/`api_base` (read from FUGU_API_KEY/FUGU_BASE_URL)."""
-    def __init__(self, slot_models: list[str],
-                 api_key: str | None = None, api_base: str | None = None,
-                 max_tokens: int = 1024, temperature: float = 0.2):
-        import litellm
-        self.litellm = litellm
-        self.slot_models = slot_models
-        self.api_key = api_key or os.environ.get("FUGU_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.api_base = api_base or os.environ.get("FUGU_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-        self.max_tokens, self.temperature = max_tokens, temperature
-
-    def __call__(self, role_name: str, messages: list, agent_id: int) -> str:
-        model = self.slot_models[agent_id % len(self.slot_models)]
-        msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
-        kw = dict(model=model, messages=msgs,
-                  max_tokens=self.max_tokens, temperature=self.temperature)
-        if self.api_key:  kw["api_key"] = self.api_key
-        if self.api_base: kw["api_base"] = self.api_base
-        r = self.litellm.completion(**kw)
-        return r.choices[0].message.content or ""
 
 
 # ---- the coordination loop (step_trinity, faithful) -------------------------

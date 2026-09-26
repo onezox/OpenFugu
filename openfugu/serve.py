@@ -21,16 +21,23 @@ Query:
   curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"..."}]}'
 """
 from __future__ import annotations
-import argparse, json, sys, time, uuid
+
+import argparse
+import json
+import logging
+import sys
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from openfugu.llm import ConfigError, check_endpoint, router_endpoint
-from openfugu.mini import ApiRouter, Coordinator, LiteLLMWorker
+from openfugu.llm import (ConfigError, LLMCallError, WorkerPool, check_endpoint,
+                          configure_logging, parse_slot_models, router_endpoint)
+from openfugu.mini import MAX_TURNS, ApiRouter, Coordinator
 
-ROUTER: ApiRouter | None = None
-WORKER = None
+logger = logging.getLogger("openfugu.serve")
+
 MODEL_NAME = "fugu"
-MAX_TURNS = 5
+BIND_HOST = "0.0.0.0"
 
 
 def _chat_response(text: str, model: str, usage_turns: int) -> dict:
@@ -49,8 +56,22 @@ def _chat_response(text: str, model: str, usage_turns: int) -> dict:
     }
 
 
+class FuguServer(ThreadingHTTPServer):
+    """HTTP server that holds the router, worker pool and turn budget for its handlers."""
+
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], router: ApiRouter, workers: WorkerPool,
+                 max_turns: int = MAX_TURNS) -> None:
+        super().__init__(address, Handler)
+        self.router, self.workers, self.max_turns = router, workers, max_turns
+
+
 class Handler(BaseHTTPRequestHandler):
+    """Serves /v1/chat/completions, /v1/models and /health."""
+
     protocol_version = "HTTP/1.1"
+    server: FuguServer
 
     def _send(self, code: int, body: dict):
         data = json.dumps(body).encode()
@@ -81,43 +102,64 @@ class Handler(BaseHTTPRequestHandler):
             # the user query = last user message; coordinator runs the full loop
             query = next((m["content"] for m in reversed(messages)
                           if m.get("role") == "user"), "")
-            coord = Coordinator(ROUTER, WORKER, max_turns=MAX_TURNS)
+            coord = Coordinator(self.server.router, self.server.workers,
+                                max_turns=self.server.max_turns)
             res = coord.run(query)
             self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME),
                                            len(res.turns)))
-        except Exception as e:
-            self._send(500, {"error": str(e)})
+        except LLMCallError as exc:            # expected: a model call failed after retries
+            logger.error("POST /v1/chat/completions failed: %s", exc)
+            self._send(500, {"error": "internal server error"})
+        except Exception:
+            logger.exception("POST /v1/chat/completions failed")
+            self._send(500, {"error": "internal server error"})
 
-    def log_message(self, *a):       # quiet
-        pass
+    def log_message(self, format: str, *args) -> None:
+        """Route http.server's access log to the logging module (DEBUG)."""
+        logger.debug("%s - " + format, self.address_string(), *args)
 
 
-def main():
-    global ROUTER, WORKER, MAX_TURNS
+def main(argv: list[str] | None = None) -> int:
+    """Validate the configuration, then serve until interrupted."""
     ap = argparse.ArgumentParser(description="Serve Fugu as one OpenAI-compatible model.")
     ap.add_argument("--slot-models", metavar="CSV", required=True,
                     help="comma-separated litellm worker model ids, one per agent slot")
     ap.add_argument("--port", type=int, default=8088)
-    ap.add_argument("--max-turns", type=int, default=5)
-    args = ap.parse_args()
-    MAX_TURNS = args.max_turns
-    slot_models = args.slot_models.split(",")
+    ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
+    args = ap.parse_args(argv)
+    if not 0 < args.port < 65536:
+        ap.error("--port must be between 1 and 65535")
+    if args.max_turns < 1:
+        ap.error("--max-turns must be at least 1")
+    configure_logging(logging.INFO)
 
     try:
+        slot_models = parse_slot_models(args.slot_models)
+        workers = WorkerPool.from_env(slot_models)
+        workers.check()
         endpoint = router_endpoint()
         check_endpoint(endpoint, "router")
     except ConfigError as exc:
-        sys.exit(f"[serve] configuration error: {exc}")
-    ROUTER = ApiRouter(endpoint, slot_models)
-    print(f"[serve] router: {endpoint.model}", flush=True)
+        logger.error("configuration error: %s", exc)
+        return 1
+    router = ApiRouter(endpoint, slot_models)
 
-    WORKER = LiteLLMWorker(slot_models=slot_models)
-    print(f"[serve] worker pool: litellm ({len(slot_models)} slots)", flush=True)
-
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"[serve] Fugu listening on :{args.port} — POST /v1/chat/completions", flush=True)
-    srv.serve_forever()
+    try:
+        server = FuguServer((BIND_HOST, args.port), router, workers, args.max_turns)
+    except OSError as exc:
+        logger.error("cannot listen on %s:%d: %s", BIND_HOST, args.port, exc)
+        return 1
+    logger.info("router: %s", endpoint.model)
+    logger.info("worker pool (%d): %s", len(workers), ", ".join(slot_models))
+    logger.info("Fugu listening on %s:%d - POST /v1/chat/completions", BIND_HOST, args.port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("shutting down")
+    finally:
+        server.server_close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

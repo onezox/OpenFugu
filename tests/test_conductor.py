@@ -320,12 +320,31 @@ def test_cli_rejects_an_invalid_workflow_before_any_worker_call(
     assert "Traceback" not in stderr
 
 
-def test_cli_reports_missing_conductor_configuration(fake_llm, capsys):
+def test_cli_reports_missing_conductor_configuration(fake_llm, monkeypatch, capsys):
+    monkeypatch.setenv("FUGU_API_KEY", "test-key")
     fake = fake_llm([])
     assert run_cli() == 1
     assert fake.calls == []
     assert ("configuration error: no Conductor model: set FUGU_CONDUCTOR_MODEL"
             in capsys.readouterr().err)
+
+
+def test_cli_reports_a_worker_without_credentials(fake_llm, monkeypatch, capsys):
+    monkeypatch.setenv("FUGU_CONDUCTOR_MODEL", CONDUCTOR)
+    monkeypatch.setenv("FUGU_CONDUCTOR_API_KEY", "conductor-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    fake = fake_llm([])
+    assert run_cli(slots="anthropic/claude-test") == 1
+    assert fake.calls == []
+    assert ("configuration error: worker 0 model 'anthropic/claude-test': no API key"
+            in capsys.readouterr().err)
+
+
+def test_cli_rejects_empty_slot_entries(fake_llm, conductor_env, capsys):
+    fake = fake_llm([])
+    assert run_cli(slots="openai/w0,,openai/w1") == 1
+    assert fake.calls == []
+    assert "configuration error: --slot-models" in capsys.readouterr().err
 
 
 def test_cli_reports_a_failed_conductor_call(fake_llm, conductor_env, capsys):
@@ -337,13 +356,23 @@ def test_cli_reports_a_failed_conductor_call(fake_llm, conductor_env, capsys):
     assert "Traceback" not in stderr
 
 
+def test_cli_reports_a_failed_worker_call(fake_llm, conductor_env, capsys):
+    def respond(kwargs):
+        return CANNED if kwargs["model"] == CONDUCTOR else auth_error()
+    fake = fake_llm(respond)
+    assert run_cli() == 1
+    assert [call["model"] for call in fake.calls] == [CONDUCTOR, "openai/w2"]
+    stderr = capsys.readouterr().err
+    assert "worker call failed: openai/w2: AuthenticationError" in stderr
+    assert "Traceback" not in stderr
+
+
 def test_conductor_uses_its_own_credentials(fake_llm, monkeypatch):
     for name, value in {"FUGU_CONDUCTOR_MODEL": CONDUCTOR,
                         "FUGU_CONDUCTOR_API_KEY": "conductor-key",
                         "FUGU_CONDUCTOR_BASE_URL": "http://conductor.test/v1",
                         "FUGU_API_KEY": "worker-key"}.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     fake = fake_llm(scripted(workflow_text()))
     assert run_cli(slots="openai/w0") == 0
     conductor_call, worker_call = fake.calls
