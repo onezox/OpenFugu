@@ -11,7 +11,9 @@ runs the step_trinity loop until a verifier accepts. The caller never sees the
 pool.
 
 stdlib http.server only — no FastAPI/uvicorn (ponytail: a router endpoint needs
-a socket and a JSON handler, not a web framework).
+a socket and a JSON handler, not a web framework). The server listens on
+127.0.0.1 unless --host says otherwise, and has no authentication; put a
+reverse proxy in front of it to expose it.
 
 Run:
   FUGU_CONDUCTOR_MODEL=... FUGU_API_KEY=... FUGU_BASE_URL=... \
@@ -37,7 +39,36 @@ from openfugu.mini import MAX_TURNS, ApiRouter, Coordinator
 logger = logging.getLogger("openfugu.serve")
 
 MODEL_NAME = "fugu"
-BIND_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"
+
+
+class BadRequest(ValueError):
+    """The request body is malformed; the message is returned as a 400 error."""
+
+
+def _message_text(content: object) -> str:
+    """A message's text: a string, or the text parts of an OpenAI content-part
+    list joined by newlines (other part types, such as images, are skipped)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part["text"] for part in content
+                         if isinstance(part, dict) and part.get("type") == "text"
+                         and isinstance(part.get("text"), str))
+    raise BadRequest("message content must be a string or a list of content parts")
+
+
+def _user_query(request: object) -> str:
+    """The text of the last user message; the coordinator answers this query."""
+    if not isinstance(request, dict):
+        raise BadRequest("request body must be a JSON object")
+    messages = request.get("messages", [])
+    if not messages:
+        raise BadRequest("messages required")
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        raise BadRequest("messages must be a list of message objects")
+    user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    return _message_text(user.get("content")) if user else ""
 
 
 def _chat_response(text: str, model: str, usage_turns: int) -> dict:
@@ -95,24 +126,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"}); return
         try:
             n = int(self.headers.get("Content-Length", 0))
+            if n < 0:
+                raise ValueError("negative Content-Length")
             req = json.loads(self.rfile.read(n) or b"{}")
-            messages = req.get("messages", [])
-            if not messages:
-                self._send(400, {"error": "messages required"}); return
-            # the user query = last user message; coordinator runs the full loop
-            query = next((m["content"] for m in reversed(messages)
-                          if m.get("role") == "user"), "")
+        except ValueError:
+            self._send(400, {"error": "invalid JSON body"}); return
+        try:
+            query = _user_query(req)      # last user message; the coordinator runs the full loop
+        except BadRequest as exc:
+            self._send(400, {"error": str(exc)}); return
+        try:
             coord = Coordinator(self.server.router, self.server.workers,
                                 max_turns=self.server.max_turns)
             res = coord.run(query)
-            self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME),
-                                           len(res.turns)))
         except LLMCallError as exc:            # expected: a model call failed after retries
             logger.error("POST /v1/chat/completions failed: %s", exc)
-            self._send(500, {"error": "internal server error"})
+            self._send(500, {"error": "internal server error"}); return
         except Exception:
             logger.exception("POST /v1/chat/completions failed")
-            self._send(500, {"error": "internal server error"})
+            self._send(500, {"error": "internal server error"}); return
+        self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME), len(res.turns)))
 
     def log_message(self, format: str, *args) -> None:
         """Route http.server's access log to the logging module (DEBUG)."""
@@ -124,9 +157,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Serve Fugu as one OpenAI-compatible model.")
     ap.add_argument("--slot-models", metavar="CSV", required=True,
                     help="comma-separated litellm worker model ids, one per agent slot")
+    ap.add_argument("--host", default=DEFAULT_HOST,
+                    help=f"IPv4 address or hostname to listen on (default {DEFAULT_HOST}; "
+                         f"the server has no authentication, so expose it only behind a "
+                         f"reverse proxy)")
     ap.add_argument("--port", type=int, default=8088)
     ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
     args = ap.parse_args(argv)
+    if not args.host.strip():
+        ap.error("--host must not be empty")
     if not 0 < args.port < 65536:
         ap.error("--port must be between 1 and 65535")
     if args.max_turns < 1:
@@ -145,13 +184,13 @@ def main(argv: list[str] | None = None) -> int:
     router = ApiRouter(endpoint, slot_models)
 
     try:
-        server = FuguServer((BIND_HOST, args.port), router, workers, args.max_turns)
+        server = FuguServer((args.host, args.port), router, workers, args.max_turns)
     except OSError as exc:
-        logger.error("cannot listen on %s:%d: %s", BIND_HOST, args.port, exc)
+        logger.error("cannot listen on %s:%d: %s", args.host, args.port, exc)
         return 1
     logger.info("router: %s", endpoint.model)
     logger.info("worker pool (%d): %s", len(workers), ", ".join(slot_models))
-    logger.info("Fugu listening on %s:%d - POST /v1/chat/completions", BIND_HOST, args.port)
+    logger.info("Fugu listening on %s:%d - POST /v1/chat/completions", args.host, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -7,12 +7,14 @@ import http.client
 import json
 import logging
 import re
+import socket
 import threading
 import time
 
 import pytest
 
 from fakes import auth_error
+from openfugu import serve
 from openfugu.llm import Endpoint, WorkerPool
 from openfugu.mini import ApiRouter
 from openfugu.serve import FuguServer, main
@@ -174,9 +176,82 @@ def test_main_rejects_empty_slot_entries(monkeypatch, caplog):
     [],
     ["--slot-models", "openai/w0", "--port", "70000"],
     ["--slot-models", "openai/w0", "--max-turns", "0"],
+    ["--slot-models", "openai/w0", "--host", " "],
     ["--slot-models", "openai/w0", "--model", "qwen"],
-], ids=["no-slot-models", "bad-port", "zero-turns", "removed-model-flag"])
+], ids=["no-slot-models", "bad-port", "zero-turns", "empty-host", "removed-model-flag"])
 def test_main_rejects_bad_or_removed_options(argv):
     with pytest.raises(SystemExit) as info:
         main(argv)
     assert info.value.code == 2
+
+
+# ---- request handling fixes ----------------------------------------------------
+def test_invalid_json_body_is_a_400(fake_llm, fugu_server):
+    fake = fake_llm([])
+    status, raw = request(fugu_server(), "POST", "/v1/chat/completions", b'{"messages": [')
+    assert (status, raw) == (400, b'{"error": "invalid JSON body"}')
+    assert fake.calls == []
+
+
+def test_negative_content_length_is_a_400(fugu_server):
+    with socket.create_connection(fugu_server(), timeout=10) as sock:
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\n"
+                     b"Content-Length: -1\r\nConnection: close\r\n\r\n")
+        response = b""
+        while chunk := sock.recv(65536):
+            response += chunk
+    assert response.startswith(b"HTTP/1.1 400 ")
+    assert response.endswith(b'{"error": "invalid JSON body"}')
+
+
+@pytest.mark.parametrize("payload, error", [
+    ([{"role": "user", "content": "Q"}], "request body must be a JSON object"),
+    ({"messages": "Q"}, "messages must be a list of message objects"),
+    ({"messages": ["Q"]}, "messages must be a list of message objects"),
+    ({"messages": [{"role": "user", "content": 42}]},
+     "message content must be a string or a list of content parts"),
+    ({"messages": [{"role": "user"}]},
+     "message content must be a string or a list of content parts"),
+], ids=["body-not-object", "messages-not-list", "message-not-object", "numeric-content",
+        "missing-content"])
+def test_malformed_requests_are_a_400_not_a_500(fake_llm, fugu_server, payload, error):
+    fake = fake_llm([])
+    status, raw = chat(fugu_server(), payload)
+    assert (status, json.loads(raw)) == (400, {"error": error})
+    assert fake.calls == []
+
+
+def test_content_part_lists_are_joined(fake_llm, fugu_server):
+    fake = fake_llm(solve_then_accept)
+    content = [{"type": "text", "text": "What is"},
+               {"type": "image_url", "image_url": {"url": "https://example.test/sum.png"}},
+               {"type": "text", "text": "2+2?"}]
+    status, raw = chat(fugu_server(), {"messages": [{"role": "user", "content": content}]})
+    assert status == 200
+    assert json.loads(raw)["choices"][0]["message"]["content"] == SOLVER_REPLY
+    assert fake.calls[0]["messages"][1]["content"].startswith("What is\n2+2?\n<state>")
+    assert fake.calls[1]["messages"][-1]["content"] == "What is\n2+2?"
+
+
+@pytest.mark.parametrize("host_args, address", [
+    ([], ("127.0.0.1", 8123)),
+    (["--host", "0.0.0.0"], ("0.0.0.0", 8123)),
+], ids=["default-localhost", "all-interfaces"])
+def test_main_binds_to_localhost_unless_host_is_given(monkeypatch, host_args, address):
+    bound = []
+
+    class StubServer:
+        def __init__(self, address, router, workers, max_turns):
+            bound.append(address)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(serve, "FuguServer", StubServer)
+    monkeypatch.setenv("FUGU_CONDUCTOR_MODEL", ROUTER_MODEL)
+    monkeypatch.setenv("FUGU_API_KEY", "test-key")
+    assert main(["--slot-models", "openai/w0", "--port", "8123", *host_args]) == 0
+    assert bound == [address]
